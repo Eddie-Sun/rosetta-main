@@ -1000,7 +1000,15 @@ async function fetchFallback(url, originalRequest = null) {
       }
     });
   } catch {
-    return jsonResponse({ error: 'Failed to fetch origin' }, 502);
+    // Rule 1.3.2: Never return 5xx to crawlers
+    return new Response('<!-- Rosetta: Origin unavailable -->', {
+      status: 200,
+      headers: {
+        'Content-Type': 'text/html; charset=utf-8',
+        'X-Rosetta-Status': 'error',
+        'Access-Control-Allow-Origin': '*'
+      }
+    });
   }
 }
 

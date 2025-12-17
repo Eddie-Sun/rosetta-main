@@ -1,5 +1,7 @@
 import { spawn } from 'child_process';
 import { ok, strictEqual } from 'assert';
+import * as fs from 'fs';
+import * as path from 'path';
 
 /**
  * E2E Validation Script for Rosetta
@@ -32,6 +34,7 @@ async function runTests() {
             name: 'AI Bot (GPTBot)',
             headers: { 'User-Agent': 'Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko); compatible; GPTBot/1.1; +https://openai.com/gptbot' },
             query: `?target=${TEST_ORIGIN}`,
+            snapshot: 'golden-gptbot.md',
             expect: {
                 status: 200,
                 isMarkdown: true,
@@ -91,6 +94,34 @@ async function runTests() {
             }
             if (t.expect.isMarkdown === false && isMd) {
                 throw new Error('Expected HTML, got Markdown');
+            }
+
+            // Snapshot check
+            // @ts-ignore
+            if (t.snapshot) {
+                // @ts-ignore
+                const safeName = t.snapshot;
+                const snapshotPath = path.resolve(__dirname, '../tests/fixtures', safeName);
+
+                if (process.env.UPDATE_SNAPSHOTS) {
+                    fs.mkdirSync(path.dirname(snapshotPath), { recursive: true });
+                    fs.writeFileSync(snapshotPath, text);
+                    console.log(`  📸 Updated snapshot: ${safeName}`);
+                } else if (fs.existsSync(snapshotPath)) {
+                    const expected = fs.readFileSync(snapshotPath, 'utf8');
+                    // Normalize line endings for comparison
+                    const normText = text.replace(/\r\n/g, '\n');
+                    const normExpected = expected.replace(/\r\n/g, '\n');
+
+                    if (normText !== normExpected) {
+                        // Don't spam console with full diff, just error
+                        const diffIdx = [...normText].findIndex((c, i) => c !== normExpected[i]);
+                        const snippet = normText.slice(Math.max(0, diffIdx - 20), diffIdx + 20);
+                        throw new Error(`Snapshot mismatch at char ${diffIdx}: "...${snippet.replace(/\n/g, '\\n')}..."`);
+                    }
+                } else {
+                    console.warn(`  ⚠️  Snapshot missing: ${safeName} (Run UPDATE_SNAPSHOTS=1 to create)`);
+                }
             }
 
             console.log(`  ✅ Passed (${rStatus || 'Origin'})`);
