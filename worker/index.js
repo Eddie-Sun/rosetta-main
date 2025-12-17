@@ -164,7 +164,7 @@ function isAIBot(ua, customerConfig = null) {
   // Check customer includes + default AI bots
   const includes = customerConfig?.bot_overrides?.include || [];
   const allBots = [...AI_BOTS, ...includes];
-  
+
   return allBots.some(bot => lower.includes(bot.toLowerCase()));
 }
 
@@ -178,12 +178,12 @@ function isAIBot(ua, customerConfig = null) {
  */
 function isPrivateHost(hostname) {
   const lower = hostname.toLowerCase();
-  
+
   // Check common private hostnames
   if (lower === 'localhost' || lower.endsWith('.local') || lower.endsWith('.internal')) {
     return true;
   }
-  
+
   // Check private IP patterns
   return PRIVATE_IP_PATTERNS.some(pattern => pattern.test(hostname));
 }
@@ -218,10 +218,109 @@ export default {
 };
 
 // =============================================================================
+// OBSERVABILITY & LOGGING
+// =============================================================================
+
+const LOG_SAMPLE_RATE = 0.01; // 1% of success requests
+
+class Logger {
+  constructor(request, ctx) {
+    this.start = Date.now();
+    this.requestId = request.headers.get('cf-ray') || crypto.randomUUID();
+    this.method = request.method;
+    this.url = request.url;
+    this.path = new URL(request.url).pathname;
+    this.userAgent = request.headers.get('user-agent') || '';
+    this.ctx = ctx;
+    this.logs = [];
+    this.meta = {
+      botFamily: this.detectBotFamily(this.userAgent),
+      tenantId: 'anonymous',
+      cacheStatus: 'MISS',
+      status: 200,
+      originStatus: 0,
+    };
+  }
+
+  detectBotFamily(ua) {
+    const lower = ua.toLowerCase();
+    if (lower.includes('gpt')) return 'gpt';
+    if (lower.includes('claude')) return 'claude';
+    if (lower.includes('google')) return 'google';
+    if (lower.includes('bing')) return 'bing';
+    if (lower.includes('perplexity')) return 'perplexity';
+    if (lower.includes('amazon')) return 'amazon';
+    if (lower.includes('facebook') || lower.includes('meta')) return 'meta';
+    if (lower.includes('byte')) return 'bytedance';
+    return 'unknown';
+  }
+
+  setTenant(id) {
+    this.meta.tenantId = id;
+  }
+
+  setCacheStatus(status) {
+    this.meta.cacheStatus = status;
+  }
+
+  setOriginStatus(status) {
+    this.meta.originStatus = status;
+  }
+
+  error(msg, err) {
+    this.logs.push({ level: 'error', msg, err: err?.message || String(err), stack: err?.stack });
+    this.flush(true); // Always flush errors
+  }
+
+  info(msg, data) {
+    this.logs.push({ level: 'info', msg, data });
+  }
+
+  flush(force = false) {
+    const duration = Date.now() - this.start;
+    const isError = this.logs.some(l => l.level === 'error');
+
+    if (!force && !isError && Math.random() > LOG_SAMPLE_RATE) {
+      return;
+    }
+
+    const envelope = {
+      requestId: this.requestId,
+      timestamp: new Date().toISOString(),
+      method: this.method,
+      path: this.path,
+      botFamily: this.meta.botFamily,
+      tenantId: this.meta.tenantId,
+      status: this.meta.status,
+      cacheStatus: this.meta.cacheStatus,
+      originStatus: this.meta.originStatus || this.meta.status, // Fallback if not set
+      latencyMs: duration,
+      logs: this.logs
+    };
+
+    console.log(JSON.stringify(envelope));
+  }
+}
+
+// =============================================================================
 // API MODE HANDLER - GET /render?url=X
 // =============================================================================
 
 async function handleRenderAPI(request, url, env, ctx) {
+  const logger = new Logger(request, ctx);
+
+  try {
+    const result = await _handleRenderLogic(request, url, env, ctx, logger);
+    logger.meta.status = result.status;
+    ctx.waitUntil(Promise.resolve(logger.flush()));
+    return result;
+  } catch (err) {
+    logger.error('Unhandled API Error', err);
+    return jsonResponse({ error: 'Internal Server Error', requestId: logger.requestId }, 500);
+  }
+}
+
+async function _handleRenderLogic(request, url, env, ctx, logger) {
   // 1. AUTH
   const token = request.headers.get('X-Rosetta-Token');
   if (!token) {
@@ -232,13 +331,15 @@ async function handleRenderAPI(request, url, env, ctx) {
   try {
     customer = await env.ROSETTA_CACHE.get(`apikey:${token}`, 'json');
   } catch (err) {
-    console.error('KV auth lookup failed:', err);
+    logger.error('KV auth lookup failed', err);
     return jsonResponse({ error: 'Auth service unavailable' }, 503);
   }
 
   if (!customer) {
     return jsonResponse({ error: 'Invalid API token' }, 401);
   }
+
+  logger.setTenant(customer.id);
 
   // 2. VALIDATE URL
   const targetUrl = url.searchParams.get('url');
@@ -278,11 +379,12 @@ async function handleRenderAPI(request, url, env, ctx) {
   try {
     cached = await env.ROSETTA_CACHE.get(cacheKey);
   } catch (err) {
-    console.error('KV cache read failed:', err);
+    logger.error('KV cache read failed', err);
     // Continue to extraction
   }
 
   if (cached && !isHTML(cached)) {
+    logger.setCacheStatus('HIT');
     return new Response(cached, {
       headers: {
         'Content-Type': 'text/markdown; charset=utf-8',
@@ -299,7 +401,7 @@ async function handleRenderAPI(request, url, env, ctx) {
   try {
     pending = await env.ROSETTA_CACHE.get(pendingKey);
   } catch (err) {
-    console.error('KV pending read failed:', err);
+    logger.error('KV pending read failed', err);
   }
 
   if (pending) {
@@ -309,6 +411,7 @@ async function handleRenderAPI(request, url, env, ctx) {
       try {
         const md = await env.ROSETTA_CACHE.get(cacheKey);
         if (md && !isHTML(md)) {
+          logger.setCacheStatus('HIT');
           return new Response(md, {
             headers: {
               'Content-Type': 'text/markdown; charset=utf-8',
@@ -319,10 +422,11 @@ async function handleRenderAPI(request, url, env, ctx) {
           });
         }
       } catch (err) {
-        console.error('KV poll read failed:', err);
+        logger.error('KV poll read failed', err);
       }
     }
     // Timed out waiting, return fallback
+    logger.setCacheStatus('MISS');
     return await fetchFallback(canonical, request);
   }
 
@@ -330,7 +434,7 @@ async function handleRenderAPI(request, url, env, ctx) {
   try {
     await env.ROSETTA_CACHE.put(pendingKey, Date.now().toString(), { expirationTtl: PENDING_TTL });
   } catch (err) {
-    console.error('KV pending write failed:', err);
+    logger.error('KV pending write failed', err);
   }
 
   try {
@@ -340,18 +444,19 @@ async function handleRenderAPI(request, url, env, ctx) {
       // Cache the result (fire and forget)
       ctx.waitUntil(
         env.ROSETTA_CACHE.put(cacheKey, md, { expirationTtl: CACHE_TTL })
-          .catch(err => console.error('KV cache write failed:', err))
+          .catch(err => logger.error('KV cache write failed', err))
       );
 
       // Clean up pending marker
       ctx.waitUntil(
         env.ROSETTA_CACHE.delete(pendingKey)
-          .catch(err => console.error('KV pending delete failed:', err))
+          .catch(err => logger.error('KV pending delete failed', err))
       );
 
       // Track usage (fire and forget)
       ctx.waitUntil(incrementUsage(env, customer.id));
 
+      logger.setCacheStatus('MISS');
       return new Response(md, {
         headers: {
           'Content-Type': 'text/markdown; charset=utf-8',
@@ -362,13 +467,13 @@ async function handleRenderAPI(request, url, env, ctx) {
       });
     }
   } catch (err) {
-    console.error('Extract failed:', err);
+    logger.error('Extract failed', err);
   }
 
   // Clean up pending marker on failure
   ctx.waitUntil(
     env.ROSETTA_CACHE.delete(pendingKey)
-      .catch(err => console.error('KV pending delete failed:', err))
+      .catch(err => logger.error('KV pending delete failed', err))
   );
 
   return await fetchFallback(canonical, request);
@@ -796,9 +901,9 @@ function isHTML(content) {
   // Remove BOM if present and trim
   const trimmed = content.replace(/^\uFEFF/, '').trim().toLowerCase();
   return trimmed.startsWith('<!doctype') ||
-         trimmed.startsWith('<html') ||
-         trimmed.startsWith('<?xml') ||  // XHTML
-         (trimmed.startsWith('<!--') && trimmed.includes('<html'));
+    trimmed.startsWith('<html') ||
+    trimmed.startsWith('<?xml') ||  // XHTML
+    (trimmed.startsWith('<!--') && trimmed.includes('<html'));
 }
 
 /**
@@ -816,8 +921,6 @@ async function scrapeWithTimeout(targetUrl, apiKey, timeoutMs) {
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    console.log(`Scraping ${targetUrl} with Firecrawl...`);
-
     const response = await fetch(FIRECRAWL_SCRAPE_URL, {
       method: 'POST',
       headers: {
@@ -877,7 +980,7 @@ async function scrapeWithTimeout(targetUrl, apiKey, timeoutMs) {
 async function fetchFallback(url, originalRequest = null) {
   try {
     const headers = new Headers();
-    
+
     // Forward safe headers from original request
     if (originalRequest) {
       for (const h of SAFE_FORWARD_HEADERS) {
@@ -885,7 +988,7 @@ async function fetchFallback(url, originalRequest = null) {
         if (val) headers.set(h, val);
       }
     }
-    
+
     const res = await fetch(url, { headers });
     const html = await res.text();
     return new Response(html, {
@@ -905,14 +1008,14 @@ async function fetchFallback(url, originalRequest = null) {
  * Proxy request to origin
  * Strips sensitive headers (API tokens, CF internal headers) before forwarding
  */
-async function proxyToOrigin(targetUrl, request) {
+async function proxyToOrigin(targetUrl, request, logger = null) {
   // Clone headers and strip sensitive ones
   const headers = new Headers(request.headers);
   for (const h of STRIP_HEADERS) {
     headers.delete(h);
   }
   headers.set('Host', targetUrl.hostname);
-  
+
   const proxyRequest = new Request(targetUrl, {
     method: request.method,
     headers,
@@ -921,6 +1024,11 @@ async function proxyToOrigin(targetUrl, request) {
   });
 
   const response = await fetch(proxyRequest);
+
+  if (logger) {
+    logger.setOriginStatus(response.status);
+  }
+
   const newResponse = new Response(response.body, response);
   newResponse.headers.set('Vary', 'User-Agent');
   return newResponse;
