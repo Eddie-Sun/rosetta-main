@@ -1,0 +1,11 @@
+{
+  "name": "@rosetta/express",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "index.ts",
+  "peerDependencies": {
+    "express": ">=4.0.0"
+  }
+}
+

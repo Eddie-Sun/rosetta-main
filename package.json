@@ -1,0 +1,14 @@
+{
+  "name": "rosetta",
+  "version": "0.0.1",
+  "private": true,
+  "scripts": {
+    "dev:worker": "pnpm --filter worker dev",
+    "dev:dashboard": "pnpm --filter dashboard dev",
+    "deploy:worker": "pnpm --filter worker deploy"
+  },
+  "devDependencies": {
+    "typescript": "^5.3.0"
+  }
+}
+

@@ -1,0 +1,15 @@
+name = "rosetta-worker"
+main = "index.js"
+compatibility_date = "2024-03-20"
+
+# Bind the KV Namespace
+[[kv_namespaces]]
+binding = "ROSETTA_CACHE"
+id = "dd605207d5b74e289c06acf59e7fef73"
+preview_id = "d52a240e3362426d9e83a20789e2e400"
+
+[vars]
+# Default config
+FIRECRAWL_API_URL = "https://api.firecrawl.dev/v1/scrape"
+# FIRECRAWL_API_KEY will be set via `wrangler secret put`
+

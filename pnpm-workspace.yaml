@@ -1,0 +1,5 @@
+packages:
+  - 'worker'
+  - 'dashboard'
+  - 'packages/*'
+

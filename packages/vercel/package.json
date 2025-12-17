@@ -1,0 +1,11 @@
+{
+  "name": "@rosetta/vercel",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "index.ts",
+  "peerDependencies": {
+    "next": ">=13.0.0"
+  }
+}
+

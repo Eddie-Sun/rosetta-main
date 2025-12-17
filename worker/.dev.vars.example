@@ -1,0 +1,5 @@
+# Copy this file to .dev.vars and fill in your values
+# .dev.vars is gitignored and used for local development
+
+FIRECRAWL_API_KEY=fc-your-api-key-here
+
