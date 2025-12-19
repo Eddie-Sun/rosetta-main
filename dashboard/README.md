@@ -24,6 +24,25 @@ CLERK_SECRET_KEY=YOUR_SECRET_KEY
 
 Restart `pnpm dev` after changing env vars.
 
+### Prereqs (Database)
+
+This dashboard uses Prisma + Postgres (Neon recommended).
+
+1. Create a Neon database and copy the pooled + direct connection strings.
+2. Add `DATABASE_URL` to `dashboard/.env.local`.
+
+Template:
+
+```bash
+cat neon.prisma.env.example
+```
+
+Then run migrations (requires env vars set):
+
+```bash
+pnpm prisma:migrate
+```
+
 ### Run
 
 First, run the development server:

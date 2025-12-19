@@ -1,0 +1,83 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+}
+
+enum Plan {
+  free
+  pro
+  team
+  enterprise
+}
+
+enum PublishJobState {
+  pending
+  success
+  failed
+}
+
+enum PublishJobKind {
+  auth_kv_sync
+}
+
+model Customer {
+  id          String   @id
+  clerkUserId String   @unique
+  plan        Plan     @default(free)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  domains     Domain[]
+  apiTokens   ApiToken[]
+  publishJobs PublishJob[]
+}
+
+model Domain {
+  id         String   @id
+  customerId String
+  hostname   String
+  verified   Boolean  @default(false)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  @@unique([customerId, hostname])
+  @@index([hostname])
+}
+
+model ApiToken {
+  id          String    @id
+  customerId  String
+  tokenHash   String    @unique
+  tokenPrefix String
+  revokedAt   DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  customer    Customer  @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  @@index([customerId])
+}
+
+model PublishJob {
+  id         String          @id
+  customerId String
+  kind       PublishJobKind
+  state      PublishJobState @default(pending)
+  attempts   Int             @default(0)
+  payload    Json
+  lastError  String?
+  createdAt  DateTime        @default(now())
+  updatedAt  DateTime        @updatedAt
+
+  customer   Customer        @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  @@index([state, createdAt])
+  @@index([customerId])
+}
+
+
