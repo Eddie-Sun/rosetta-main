@@ -11,11 +11,16 @@ function Container({ children }: { children: React.ReactNode }) {
 function Section({
   children,
   className = "",
+  ...props
 }: {
   children: React.ReactNode;
   className?: string;
-}) {
-  return <section className={`bg-background text-foreground ${className}`}>{children}</section>;
+} & React.ComponentProps<"section">) {
+  return (
+    <section {...props} className={`bg-background text-foreground ${className}`}>
+      {children}
+    </section>
+  );
 }
 
 function Logo() {
@@ -302,3 +307,5 @@ export default function Home() {
     </>
   );
 }
+
+

@@ -3,7 +3,7 @@ import { auth } from "@clerk/nextjs/server";
 import { redirect } from "next/navigation";
 import { Card } from "@/components/ui/card";
 
-export default async function OnboardingTokenPage(): Promise<JSX.Element> {
+export default async function OnboardingTokenPage() {
   const { userId } = await auth();
   if (!userId) redirect("/sign-in");
 

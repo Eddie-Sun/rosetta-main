@@ -43,6 +43,16 @@ Then run migrations (requires env vars set):
 pnpm prisma:migrate
 ```
 
+### Prereqs (Firecrawl)
+
+Overview can generate a starter list of URLs using Firecrawl `/v2/map`.
+
+Add this to `dashboard/.env.local`:
+
+```bash
+FIRECRAWL_API_KEY=YOUR_FIRECRAWL_KEY
+```
+
 ### Run
 
 First, run the development server:
