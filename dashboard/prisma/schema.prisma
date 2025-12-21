@@ -26,6 +26,7 @@ enum PublishJobKind {
 model Customer {
   id          String   @id
   clerkUserId String   @unique
+  companyName String?
   plan        Plan     @default(free)
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
