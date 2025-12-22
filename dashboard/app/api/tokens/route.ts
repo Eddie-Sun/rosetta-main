@@ -10,7 +10,6 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "Not authenticated" }, { status: 401 });
     }
 
-    // Get customer with domains
     const customer = await prisma.customer.findUnique({
       where: { clerkUserId: userId },
       include: {
@@ -22,10 +21,9 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "Customer not found" }, { status: 404 });
     }
 
-    const body = await request.json().catch(() => ({}));
-    const { label } = body;
+    const body = (await request.json().catch(() => null)) as { label?: string | null } | null;
+    const label = body?.label ?? null;
 
-    // Get customer domains (normalized hostnames)
     const domains = customer.domains.map((d) => d.hostname);
 
     if (domains.length === 0) {
@@ -35,18 +33,17 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Create token
     const result = await createApiTokenForCustomer({
       customerId: customer.id,
       domains,
       plan: customer.plan,
-      label: label || null,
+      label,
     });
 
     return NextResponse.json({
       token: result.token,
       prefix: result.prefix,
-      label: label || null,
+      label,
     });
   } catch (error) {
     console.error("Error creating token:", error);

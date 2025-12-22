@@ -24,15 +24,15 @@ export function TokenGenerator() {
     setCopied(false);
 
     try {
-      const response = await fetch("/api/tokens", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({}),
-      });
+      const response = await fetch("/api/tokens", { method: "POST" });
 
       if (!response.ok) {
-        const data = await response.json();
-        throw new Error(data.error || "Failed to create token");
+        let message = "Failed to create token";
+        try {
+          const data = (await response.json()) as { error?: string };
+          if (data?.error) message = data.error;
+        } catch {}
+        throw new Error(message);
       }
 
       const data: TokenResponse = await response.json();
@@ -51,8 +51,8 @@ export function TokenGenerator() {
       await navigator.clipboard.writeText(tokenData.token);
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
-    } catch (err) {
-      console.error("Failed to copy:", err);
+    } catch {
+      setError("Failed to copy token");
     }
   };
 

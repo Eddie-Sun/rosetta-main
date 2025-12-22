@@ -9,11 +9,8 @@ import { err, ok, type Result } from "@/lib/result";
 type ActionResult = Result<void, string>;
 
 function normalizeHostname(hostname: string): string {
-  // Remove protocol if present
   let normalized = hostname.replace(/^https?:\/\//, "");
-  // Remove trailing slash
   normalized = normalized.replace(/\/$/, "");
-  // Remove www. prefix and lowercase
   normalized = normalized.toLowerCase().replace(/^www\./, "");
   return normalized;
 }
@@ -250,35 +247,13 @@ export async function checkUrlTokens(url: string): Promise<ActionResult> {
     if (!dataRes.ok) return err(dataRes.error);
     const data = dataRes.value;
 
-    // Get customer's API token (first non-revoked token)
-    const apiToken = await prisma.apiToken.findFirst({
-      where: {
-        customerId: data.customer.id,
-        revokedAt: null,
-      },
-      orderBy: { createdAt: "desc" },
-    });
-
-    if (!apiToken) {
-      return err("No API token found. Please create an API token first.");
-    }
-
-    // Get worker API URL from environment
-    const workerApiUrl =
-      process.env.NEXT_PUBLIC_WORKER_API_URL ||
-      process.env.WORKER_API_URL ||
-      "https://api.rosetta.ai";
-
-    // For MVP: Use service token from env, or construct from token prefix
-    // TODO: Store plaintext tokens securely when creating them
+    const workerApiUrl = process.env.WORKER_API_URL || "https://api.rosetta.ai";
     const serviceToken = process.env.ROSETTA_SERVICE_TOKEN;
-    
+
     if (!serviceToken) {
-      return err("Service token not configured. Please set ROSETTA_SERVICE_TOKEN environment variable.");
+      return err("ROSETTA_SERVICE_TOKEN is not set.");
     }
 
-    // Call worker API to trigger optimization
-    // This will cause the worker to extract the page, count tokens, and send metrics back
     const response = await fetch(`${workerApiUrl}/render?url=${encodeURIComponent(url)}`, {
       method: "GET",
       headers: {
@@ -287,12 +262,8 @@ export async function checkUrlTokens(url: string): Promise<ActionResult> {
     });
 
     if (!response.ok) {
-      const errorText = await response.text();
-      return err(`Worker API error: ${response.status} ${errorText}`);
+      return err(`Worker API error: ${response.status}`);
     }
-
-    // Wait a moment for metrics to be processed and sent to dashboard
-    await new Promise((resolve) => setTimeout(resolve, 2000));
 
     revalidatePath("/overview");
     return ok(undefined);

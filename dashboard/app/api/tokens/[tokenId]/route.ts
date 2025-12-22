@@ -4,7 +4,7 @@ import { prisma } from "@/lib/prisma";
 import { revokeApiToken } from "@/lib/tokens";
 
 export async function DELETE(
-  request: NextRequest,
+  _request: NextRequest,
   { params }: { params: { tokenId: string } }
 ) {
   try {

@@ -2,11 +2,22 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 
 export async function POST(request: NextRequest) {
+  const expected = process.env.DASHBOARD_API_KEY;
+  const auth = request.headers.get("authorization");
+  if (!expected || auth !== `Bearer ${expected}`) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
   try {
-    const body = await request.json();
+    const body = (await request.json()) as {
+      customerId?: string;
+      url?: string;
+      htmlTokens?: number | null;
+      mdTokens?: number | null;
+      optimizedAt?: string | Date | null;
+    };
     const { customerId, url, htmlTokens, mdTokens, optimizedAt } = body;
 
-    // Validate required fields
     if (!customerId || !url || htmlTokens === undefined || mdTokens === undefined) {
       return NextResponse.json(
         { error: "Missing required fields: customerId, url, htmlTokens, mdTokens" },
@@ -14,22 +25,16 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Normalize URL (should match worker canonicalization)
-    // Worker uses canonicalize() which removes tracking params, normalizes hostname, etc.
-    // For now, just use the URL as-is since worker sends canonicalized URL
-    const normalizedUrl = url;
-
-    // Upsert metrics
     await prisma.urlMetrics.upsert({
       where: {
         customerId_url: {
           customerId,
-          url: normalizedUrl,
+          url,
         },
       },
       create: {
         customerId,
-        url: normalizedUrl,
+        url,
         htmlTokens,
         mdTokens,
         optimizedAt: optimizedAt ? new Date(optimizedAt) : new Date(),

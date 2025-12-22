@@ -1,6 +1,7 @@
 "use client";
 
 import * as React from "react";
+import { useRouter } from "next/navigation";
 import {
   ChevronDown,
   ChevronRight,
@@ -8,7 +9,6 @@ import {
   Folder,
   Loader2,
 } from "lucide-react";
-import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { checkUrlTokens } from "./actions";
 
@@ -18,47 +18,30 @@ type UrlGroup = {
 };
 
 function groupUrlsBySection(urls: string[]): UrlGroup[] {
-  const groups: Map<string, string[]> = new Map();
+  const groups = new Map<string, string[]>();
   const rootUrls: string[] = [];
 
   for (const url of urls) {
-    try {
-      const urlObj = new URL(url);
-      const pathname = urlObj.pathname;
+    const { pathname } = new URL(url);
+    const [first] = pathname.split("/").filter(Boolean);
 
-      const pathSegments = pathname.split("/").filter(Boolean);
-      
-      if (pathSegments.length === 0) {
-        rootUrls.push(url);
-      } else {
-        const section = `/${pathSegments[0]}`;
-        
-        if (!groups.has(section)) {
-          groups.set(section, []);
-        }
-        groups.get(section)!.push(url);
-      }
-    } catch {
-      // Invalid URL, skip it
+    if (!first) {
+      rootUrls.push(url);
       continue;
     }
+
+    const section = `/${first}`;
+    const list = groups.get(section);
+    if (list) list.push(url);
+    else groups.set(section, [url]);
   }
 
-  // Convert to array and sort
   const result: UrlGroup[] = [];
-  
-  // Add root URLs if any
-  if (rootUrls.length > 0) {
-    result.push({ section: "/", urls: rootUrls });
-  }
+  if (rootUrls.length) result.push({ section: "/", urls: rootUrls });
 
-  // Add section groups, sorted by section name
-  const sortedSections = Array.from(groups.entries()).sort((a, b) => 
+  for (const [section, sectionUrls] of Array.from(groups.entries()).sort((a, b) =>
     a[0].localeCompare(b[0])
-  );
-  
-  for (const [section, sectionUrls] of sortedSections) {
-    // Sort URLs within each section
+  )) {
     sectionUrls.sort();
     result.push({ section, urls: sectionUrls });
   }
@@ -67,12 +50,7 @@ function groupUrlsBySection(urls: string[]): UrlGroup[] {
 }
 
 function pathnameFromUrl(url: string): string {
-  try {
-    const u = new URL(url);
-    return u.pathname || "/";
-  } catch {
-    return url;
-  }
+  return new URL(url).pathname || "/";
 }
 
 type TokenMetrics = {
@@ -97,9 +75,40 @@ export function UrlSections({
   domainLabel?: string | null;
   metricsMap?: Map<string, TokenMetrics>;
 }) {
+  const router = useRouter();
   const groups = groupUrlsBySection(urls);
   const [expanded, setExpanded] = React.useState<Set<string>>(() => new Set());
   const [checkingUrls, setCheckingUrls] = React.useState<Set<string>>(new Set());
+  const [error, setError] = React.useState<string | null>(null);
+
+  const onCheck = React.useCallback(
+    (url: string) =>
+      async (e: React.MouseEvent) => {
+        e.preventDefault();
+        e.stopPropagation();
+
+        setError(null);
+        setCheckingUrls((prev) => new Set(prev).add(url));
+        try {
+          const result = await checkUrlTokens(url);
+          if (!result.ok) {
+            setError(result.error);
+            return;
+          }
+          router.refresh();
+          setTimeout(() => router.refresh(), 1500);
+        } catch {
+          setError("Failed to check URL");
+        } finally {
+          setCheckingUrls((prev) => {
+            const next = new Set(prev);
+            next.delete(url);
+            return next;
+          });
+        }
+      },
+    [router]
+  );
 
   React.useEffect(() => {
     setExpanded((prev) => {
@@ -125,7 +134,9 @@ export function UrlSections({
 
   return (
     <div className="overflow-hidden border border-border bg-background">
-      {/* File browser toolbar */}
+      {error ? (
+        <div className="px-4 py-2 text-sm text-destructive border-b border-border">{error}</div>
+      ) : null}
       <div className="flex items-center justify-between px-4 py-3 bg-muted border-b border-border">
         <div className="flex items-center gap-2 text-sm text-foreground">
           <Folder className="h-4 w-4 text-accent" />
@@ -138,7 +149,6 @@ export function UrlSections({
         </div>
       </div>
 
-      {/* Column headers */}
       <div className="grid grid-cols-[1fr_100px_140px_120px_100px] gap-4 px-4 py-2 bg-muted border-b border-border text-xs text-muted-foreground font-mono">
         <span>Page</span>
         <span className="text-right">Status</span>
@@ -147,7 +157,6 @@ export function UrlSections({
         <span className="text-right">Check</span>
       </div>
 
-      {/* File list */}
       <div className="divide-y divide-border">
         {groups.map((group) => {
           const isFolder = group.urls.length > 1;
@@ -164,31 +173,7 @@ export function UrlSections({
               : "Never";
             const status = metrics ? "Optimized" : "Not checked";
             const isChecking = checkingUrls.has(url);
-            
-            const handleCheck = async (e: React.MouseEvent) => {
-              e.preventDefault();
-              e.stopPropagation();
-              setCheckingUrls((prev) => new Set(prev).add(url));
-              try {
-                const result = await checkUrlTokens(url);
-                if (!result.ok) {
-                  alert(`Failed to check URL: ${result.error}`);
-                  return;
-                }
-                // Refresh the page to show updated metrics
-                window.location.reload();
-              } catch (error) {
-                console.error("Failed to check URL:", error);
-                alert(`Failed to check URL: ${error instanceof Error ? error.message : "Unknown error"}`);
-              } finally {
-                setCheckingUrls((prev) => {
-                  const next = new Set(prev);
-                  next.delete(url);
-                  return next;
-                });
-              }
-            };
-            
+
             return (
               <div
                 key={group.section}
@@ -222,7 +207,7 @@ export function UrlSections({
                   <Button
                     variant="ghost"
                     size="sm"
-                    onClick={handleCheck}
+                    onClick={onCheck(url)}
                     disabled={isChecking}
                     className="h-7 px-2 text-xs"
                   >
@@ -239,7 +224,6 @@ export function UrlSections({
 
           return (
             <div key={group.section}>
-              {/* Folder row */}
               <button
                 type="button"
                 onClick={() => {
@@ -250,9 +234,7 @@ export function UrlSections({
                     return next;
                   });
                 }}
-                className={cn(
-                  "w-full grid grid-cols-[1fr_100px_140px_120px_100px] gap-4 px-4 py-3 hover:bg-[var(--bg-hover)] transition-colors group items-center text-left",
-                )}
+                className="w-full grid grid-cols-[1fr_100px_140px_120px_100px] gap-4 px-4 py-3 hover:bg-[var(--bg-hover)] transition-colors group items-center text-left"
               >
                 <div className="flex items-center gap-2 min-w-0">
                   {isExpanded ? (
@@ -282,7 +264,6 @@ export function UrlSections({
                 </span>
               </button>
 
-              {/* Expanded folder contents */}
               {isExpanded ? (
                 <div className="bg-background">
                   {group.urls.map((url) => {
@@ -295,31 +276,7 @@ export function UrlSections({
                       : "Never";
                     const status = metrics ? "Optimized" : "Not checked";
                     const isChecking = checkingUrls.has(url);
-                    
-                    const handleCheck = async (e: React.MouseEvent) => {
-                      e.preventDefault();
-                      e.stopPropagation();
-                      setCheckingUrls((prev) => new Set(prev).add(url));
-                      try {
-                        const result = await checkUrlTokens(url);
-                        if (!result.ok) {
-                          alert(`Failed to check URL: ${result.error}`);
-                          return;
-                        }
-                        // Refresh the page to show updated metrics
-                        window.location.reload();
-                      } catch (error) {
-                        console.error("Failed to check URL:", error);
-                        alert(`Failed to check URL: ${error instanceof Error ? error.message : "Unknown error"}`);
-                      } finally {
-                        setCheckingUrls((prev) => {
-                          const next = new Set(prev);
-                          next.delete(url);
-                          return next;
-                        });
-                      }
-                    };
-                    
+
                     return (
                       <div
                         key={url}
@@ -356,7 +313,7 @@ export function UrlSections({
                           <Button
                             variant="ghost"
                             size="sm"
-                            onClick={handleCheck}
+                            onClick={onCheck(url)}
                             disabled={isChecking}
                             className="h-7 px-2 text-xs"
                           >
@@ -379,5 +336,3 @@ export function UrlSections({
     </div>
   );
 }
-
-

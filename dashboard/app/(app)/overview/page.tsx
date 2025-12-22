@@ -23,7 +23,6 @@ export default async function Page() {
 
   const domain = customer.domains[0] ?? null;
 
-  // If not mapped/crawled yet: generate a starter list using Firecrawl map.
   if (domain) {
     const hasSnapshot = await prisma.mapSnapshot.findUnique({
       where: {
@@ -32,7 +31,6 @@ export default async function Page() {
       select: { id: true },
     });
 
-    // Best-effort: don't block page if Firecrawl fails.
     if (!hasSnapshot) {
       await generateStarterList();
     }
@@ -50,38 +48,15 @@ export default async function Page() {
     ? (mapSnapshot?.urls as string[])
     : [];
 
-  // Fetch token metrics for these URLs
-  let urlMetrics: Array<{
-    url: string;
-    htmlTokens: number | null;
-    mdTokens: number | null;
-    optimizedAt: Date;
-  }> = [];
-  
-  try {
-    if (mapUrls.length > 0 && 'urlMetrics' in prisma) {
-      urlMetrics = await (prisma as any).urlMetrics.findMany({
-        where: {
-          customerId: customer.id,
-          url: { in: mapUrls },
-        },
-        select: {
-          url: true,
-          htmlTokens: true,
-          mdTokens: true,
-          optimizedAt: true,
-        },
-      });
-    }
-  } catch (error) {
-    // If urlMetrics model isn't available yet, continue without metrics
-    console.warn('Failed to fetch URL metrics:', error);
-  }
+  const urlMetrics =
+    mapUrls.length === 0
+      ? []
+      : await prisma.urlMetrics.findMany({
+          where: { customerId: customer.id, url: { in: mapUrls } },
+          select: { url: true, htmlTokens: true, mdTokens: true, optimizedAt: true },
+        });
 
-  // Create a map for quick lookup
-  const metricsMap = new Map(
-    urlMetrics.map((m) => [m.url, m])
-  );
+  const metricsMap = new Map(urlMetrics.map((m) => [m.url, m]));
 
   const domainUrl = domain
     ? (domain.hostname.startsWith("http") ? domain.hostname : `https://${domain.hostname}`)
