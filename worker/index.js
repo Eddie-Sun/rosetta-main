@@ -29,6 +29,7 @@ const CACHE_TTL = 86400; // 24 hours (safer default to avoid stale content)
 const EXTRACT_TIMEOUT_MS = 3000; // 3 seconds (increased from 2s)
 const PENDING_TTL = 30; // Single-flight marker TTL
 const MAX_CRAWL_PAGES = 100;
+const DASHBOARD_API_URL = "https://dashboard.rosetta.ai"; // Will be configurable via env var
 
 // SSRF protection: block private/internal IP ranges
 const PRIVATE_IP_PATTERNS = [
@@ -329,7 +330,14 @@ async function _handleRenderLogic(request, url, env, ctx, logger) {
 
   let customer;
   try {
-    customer = await env.ROSETTA_CACHE.get(`apikey:${token}`, 'json');
+    // Phase 1.5: Dual lookup (hash first, then plaintext fallback)
+    const tokenHash = await sha256(token);
+    customer = await env.ROSETTA_CACHE.get(`apikeyhash:${tokenHash}`, 'json');
+    
+    if (!customer) {
+      // Legacy fallback: plaintext token lookup (for ROSETTA_SERVICE_TOKEN / manual provisioning)
+      customer = await env.ROSETTA_CACHE.get(`apikey:${token}`, 'json');
+    }
   } catch (err) {
     logger.error('KV auth lookup failed', err);
     return jsonResponse({ error: 'Auth service unavailable' }, 503);
@@ -339,7 +347,12 @@ async function _handleRenderLogic(request, url, env, ctx, logger) {
     return jsonResponse({ error: 'Invalid API token' }, 401);
   }
 
-  logger.setTenant(customer.id);
+  // Handle both legacy format (id) and V2 format (id field)
+  const customerId = customer.id || customer.customerId;
+  if (!customerId) {
+    return jsonResponse({ error: 'Invalid customer config format' }, 500);
+  }
+  logger.setTenant(customerId);
 
   // 2. VALIDATE URL
   const targetUrl = url.searchParams.get('url');
@@ -438,9 +451,12 @@ async function _handleRenderLogic(request, url, env, ctx, logger) {
   }
 
   try {
-    const md = await scrapeWithTimeout(canonical, env.FIRECRAWL_API_KEY, EXTRACT_TIMEOUT_MS);
+    const scrapeResult = await scrapeWithTimeout(canonical, env.FIRECRAWL_API_KEY, EXTRACT_TIMEOUT_MS);
 
-    if (md) {
+    if (scrapeResult && scrapeResult.markdown) {
+      const md = scrapeResult.markdown;
+      const html = scrapeResult.html;
+
       // Cache the result (fire and forget)
       ctx.waitUntil(
         env.ROSETTA_CACHE.put(cacheKey, md, { expirationTtl: CACHE_TTL })
@@ -454,7 +470,17 @@ async function _handleRenderLogic(request, url, env, ctx, logger) {
       );
 
       // Track usage (fire and forget)
-      ctx.waitUntil(incrementUsage(env, customer.id));
+      ctx.waitUntil(incrementUsage(env, customerId));
+
+      // Track token metrics (fire and forget)
+      if (html) {
+        const htmlTokens = estimateTokens(html);
+        const mdTokens = estimateTokens(md);
+        ctx.waitUntil(
+          sendTokenMetrics(env, customerId, canonical, htmlTokens, mdTokens)
+            .catch(err => logger.error('Token metrics send failed', err))
+        );
+      }
 
       logger.setCacheStatus('MISS');
       return new Response(md, {
@@ -601,7 +627,8 @@ async function handleProxyMode(request, url, env, ctx) {
   // Scrape with timeout
   let markdown = null;
   try {
-    markdown = await scrapeWithTimeout(canonical, env.FIRECRAWL_API_KEY, EXTRACT_TIMEOUT_MS);
+    const scrapeResult = await scrapeWithTimeout(canonical, env.FIRECRAWL_API_KEY, EXTRACT_TIMEOUT_MS);
+    markdown = scrapeResult?.markdown || null;
   } catch (err) {
     console.error('Scrape failed:', err);
   }
@@ -648,7 +675,14 @@ async function handleCrawlStart(request, env, ctx) {
 
   let customer;
   try {
-    customer = await env.ROSETTA_CACHE.get(`apikey:${token}`, 'json');
+    // Phase 1.5: Dual lookup (hash first, then plaintext fallback)
+    const tokenHash = await sha256(token);
+    customer = await env.ROSETTA_CACHE.get(`apikeyhash:${tokenHash}`, 'json');
+    
+    if (!customer) {
+      // Legacy fallback: plaintext token lookup
+      customer = await env.ROSETTA_CACHE.get(`apikey:${token}`, 'json');
+    }
   } catch (err) {
     console.error('KV auth lookup failed:', err);
     return jsonResponse({ error: 'Auth service unavailable' }, 503);
@@ -656,6 +690,12 @@ async function handleCrawlStart(request, env, ctx) {
 
   if (!customer) {
     return jsonResponse({ error: 'Invalid API token' }, 401);
+  }
+
+  // Handle both legacy format (id) and V2 format (id field)
+  const customerId = customer.id || customer.customerId;
+  if (!customerId) {
+    return jsonResponse({ error: 'Invalid customer config format' }, 500);
   }
 
   try {
@@ -683,7 +723,8 @@ async function handleCrawlStart(request, env, ctx) {
     const effectiveLimit = Math.min(limit, MAX_CRAWL_PAGES);
 
     if (mode === 'single') {
-      const markdown = await scrapeWithTimeout(targetUrl, env.FIRECRAWL_API_KEY, 10000); // Longer timeout for single
+      const scrapeResult = await scrapeWithTimeout(targetUrl, env.FIRECRAWL_API_KEY, 10000); // Longer timeout for single
+      const markdown = scrapeResult?.markdown || null;
 
       if (markdown && cacheResults) {
         const canonical = canonicalize(targetUrl);
@@ -734,7 +775,7 @@ async function handleCrawlStart(request, env, ctx) {
     // Store crawl metadata
     const crawlMeta = {
       id: crawlData.id,
-      customerId: customer.id,
+      customerId: customerId,
       url: targetUrl,
       limit: effectiveLimit,
       cacheResults,
@@ -768,7 +809,14 @@ async function handleCrawlStatus(crawlId, request, env, ctx) {
 
   let customer;
   try {
-    customer = await env.ROSETTA_CACHE.get(`apikey:${token}`, 'json');
+    // Phase 1.5: Dual lookup (hash first, then plaintext fallback)
+    const tokenHash = await sha256(token);
+    customer = await env.ROSETTA_CACHE.get(`apikeyhash:${tokenHash}`, 'json');
+    
+    if (!customer) {
+      // Legacy fallback: plaintext token lookup
+      customer = await env.ROSETTA_CACHE.get(`apikey:${token}`, 'json');
+    }
   } catch (err) {
     console.error('KV auth lookup failed:', err);
     return jsonResponse({ error: 'Auth service unavailable' }, 503);
@@ -778,13 +826,19 @@ async function handleCrawlStatus(crawlId, request, env, ctx) {
     return jsonResponse({ error: 'Invalid API token' }, 401);
   }
 
+  // Handle both legacy format (id) and V2 format (id field)
+  const customerId = customer.id || customer.customerId;
+  if (!customerId) {
+    return jsonResponse({ error: 'Invalid customer config format' }, 500);
+  }
+
   try {
     // Get stored metadata
     const metaRaw = await env.ROSETTA_CACHE.get(`crawl::${crawlId}`);
     const meta = metaRaw ? JSON.parse(metaRaw) : null;
 
     // Verify ownership
-    if (meta && meta.customerId !== customer.id) {
+    if (meta && meta.customerId !== customerId) {
       return jsonResponse({ error: 'Crawl job not found' }, 404);
     }
 
@@ -916,6 +970,18 @@ function sleep(ms) {
 /**
  * Scrape with Firecrawl (with timeout)
  */
+/**
+ * Estimate token count using simple character-based approximation
+ * ~4 characters per token is a reasonable estimate for English text
+ * This is a fallback - ideally use a proper tokenizer if available
+ */
+function estimateTokens(text) {
+  if (!text) return 0;
+  // Rough estimate: ~4 chars per token for English
+  // More accurate would require a tokenizer library
+  return Math.ceil(text.length / 4);
+}
+
 async function scrapeWithTimeout(targetUrl, apiKey, timeoutMs) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -929,7 +995,7 @@ async function scrapeWithTimeout(targetUrl, apiKey, timeoutMs) {
       },
       body: JSON.stringify({
         url: targetUrl,
-        formats: ['markdown'],
+        formats: ['markdown', 'html'], // Request both for token comparison
         onlyMainContent: true,
       }),
       signal: controller.signal
@@ -950,15 +1016,15 @@ async function scrapeWithTimeout(targetUrl, apiKey, timeoutMs) {
     }
 
     const md = json.data.markdown;
+    const html = json.data.html || null;
 
-    // Reject if Firecrawl returned HTML
+    // Reject if Firecrawl returned HTML instead of Markdown
     if (isHTML(md)) {
       console.error('Firecrawl returned HTML instead of Markdown');
       return null;
     }
 
-    return md;
-
+    return { markdown: md, html };
   } catch (err) {
     clearTimeout(timeout);
     if (err.name === 'AbortError') {
@@ -1062,6 +1128,35 @@ async function incrementUsage(env, customerId) {
     await env.ROSETTA_CACHE.put(key, (current + 1).toString(), { expirationTtl: 86400 * 90 });
   } catch (err) {
     console.error('Usage increment failed:', err);
+  }
+}
+
+/**
+ * Send token metrics to dashboard API
+ * Fire and forget - don't block response
+ */
+async function sendTokenMetrics(env, customerId, url, htmlTokens, mdTokens) {
+  try {
+    const dashboardUrl = env.DASHBOARD_API_URL || DASHBOARD_API_URL;
+    const apiUrl = `${dashboardUrl}/api/metrics/tokens`;
+
+    await fetch(apiUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${env.DASHBOARD_API_KEY || ''}`, // Optional API key for auth
+      },
+      body: JSON.stringify({
+        customerId,
+        url,
+        htmlTokens,
+        mdTokens,
+        optimizedAt: new Date().toISOString(),
+      }),
+    });
+  } catch (err) {
+    // Silently fail - metrics are best effort
+    console.error('Failed to send token metrics:', err);
   }
 }
 

@@ -1,4 +1,4 @@
-# Rosetta AI Engineering Rules v2.3
+# Rosetta AI Engineering Rules v2.4
 # AI Crawler Optimization Service
 # Last Updated: December 2025
 
@@ -108,6 +108,42 @@ Update the code example; do not infer that the rule has exceptions.
 
 When editing this document, ensure code examples stay consistent with rules.
 
+### 0.6 Proxy Mode (Experimental)
+
+> ⚠️ **Proxy Mode is a separate operational mode with different security properties.**
+> It is NOT the primary product. Do not conflate with API Mode.
+
+The worker supports an **experimental Proxy Mode** for demos and self-hosted deployments:
+
+| Mode | Auth | Use Case | Status |
+|------|------|----------|--------|
+| **API Mode** | Token + domain allowlist | Multi-tenant SaaS (primary) | Production |
+| **Proxy Mode** | Origin allowlist only | Demo sites, self-hosted | Experimental |
+
+**Proxy Mode Security:**
+- No API token required
+- Bot detection happens at the edge (worker)
+- Only configured origins can be proxied (`ALLOWED_PROXY_ORIGINS`)
+- Different SSRF surface (we fetch whatever the origin returns)
+
+**When to use Proxy Mode:**
+- Demo deployments (`rosetta-demo.vercel.app`)
+- Customers who can't deploy middleware
+- Self-hosted single-tenant deployments
+
+**Proxy Mode MUST NOT:**
+- Be enabled by default
+- Share auth infrastructure with API Mode
+- Be documented as the "normal" way to use Rosetta
+
+**Configuration:**
+```javascript
+const ALLOWED_PROXY_ORIGINS = [
+  'https://rosetta-demo.vercel.app',
+  // Add customer origins here for proxy mode
+];
+```
+
 ---
 
 ## 1. INVARIANTS (NON-NEGOTIABLE)
@@ -209,6 +245,88 @@ return new Response('Error', { status: 500 });
 **The middleware is responsible for this guarantee.** If the API returns an error,
 middleware falls back to origin content and serves that with 200.
 
+### 1.4 Content Equivalence Policy
+
+Rosetta transforms content for AI crawlers. This is **not cloaking** because we preserve semantic equivalence.
+
+**Rosetta MAY:**
+- Compress content (remove boilerplate, navigation, footers)
+- Convert HTML → Markdown
+- Restructure content for clarity
+- Remove styling and non-semantic elements
+
+**Rosetta MUST NOT:**
+- Introduce claims absent from the original HTML
+- Remove material claims that change meaning
+- Serve content with different factual intent to AI vs humans
+- Add promotional content not present in source
+
+> ⚠️ **If a customer requests behavior that violates this policy — refuse.**
+> This protects Rosetta from legal liability, reputation risk, and future AI compliance regimes.
+
+### 1.5 Abuse / Quota Policy
+
+Usage counters exist in KV (`usage:${customer_id}:${YYYY-MM}`). Define behavior when things go wrong.
+
+**Soft Limits (Phase 1+):**
+
+If usage exceeds plan limit by >10× in a short time window, Rosetta MAY:
+- Temporarily bypass extraction (return origin HTML as fallback)
+- Return `{ error: 'Soft limit exceeded', requestId }` with 429 status
+- Require customer remediation before resuming full service
+
+**Why this matters:**
+- Someone leaks their `ROSETTA_TOKEN` in a public repo
+- Malicious actor pipes millions of requests through our infra
+- We discover when the Firecrawl bill arrives
+
+**Enforcement priority:**
+1. **Phase 1:** Manual intervention, monitoring alerts
+2. **Phase 2:** Automated soft kill-switch (KV-based, approximate)
+3. **Phase 3+:** Durable Objects for exact counting
+
+> This is NOT billing enforcement. This prevents runaway costs.
+
+### 1.6 Data Retention Policy
+
+This will be required for enterprise security questionnaires.
+
+| Data Type | Retention | Notes |
+|-----------|-----------|-------|
+| Request logs | 30–90 days | Configurable per deployment |
+| Full URLs | NOT logged by default | `urlHash` only (privacy) |
+| Request bodies | NOT stored | Never captured |
+| Extracted content | KV cache TTL only (24h) | Auto-expires |
+| Customer configs | Until deletion | Postgres is source of truth |
+
+**Customer-specific options (Enterprise):**
+- Opt-in to full URL logging for debugging
+- Custom log retention periods
+- Dedicated log export
+
+### 1.7 SDK ↔ Worker Compatibility Contract
+
+**Guarantees:**
+
+1. **SDKs are backwards compatible with newer workers.**
+   - A middleware deployed today must work with worker updates for at least 6 months.
+
+2. **Workers must accept older SDKs for at least 6 months after any breaking change.**
+   - Breaking changes: new required headers, changed bot detection behavior, response format changes.
+
+3. **Hash formats are stable.**
+   - `sha256_hex` (lowercase, 64 chars) will not change.
+   - KV key prefixes (`md:`, `apikey:`, `apikeyhash:`) are versioned, not renamed.
+
+4. **Bot list changes are NOT breaking.**
+   - Adding/removing bots is expected evolution.
+   - SDKs importing from `@rosetta/bots` get updates automatically.
+
+**Deprecation process:**
+1. Announce deprecation (changelog, dashboard notification)
+2. 6-month grace period
+3. Remove support only after grace period
+
 ---
 
 ## 2. CORE DOMAIN TYPES (MEMORIZE THESE)
@@ -290,7 +408,22 @@ type CachedMd = {
 > When changing the schema, increment `v` and treat old versions as cache misses.
 > They'll expire naturally (24h TTL) or can be purged explicitly.
 
-### 2.5 Database & Publish Contract (Phase 2+)
+### 2.5 Auth Phases
+
+| Phase | Lookup Key | Token Stored In KV? | Status |
+|------:|------------|---------------------|--------|
+| 1 | `apikey:${token}` | Plaintext token | **CURRENT PRODUCTION** |
+| 1.5 | `apikeyhash:${sha256_hex}` + fallback to plaintext | Both (transitional) | OPTIONAL MIGRATION |
+| 2 | `apikeyhash:${sha256_hex}` | Hash only | TARGET |
+
+**Canonical Worker Behavior:**
+- **Phase 1:** Plaintext lookup only (`apikey:${token}`)
+- **Phase 1.5:** Dual lookup (try hash first, fall back to plaintext)
+- **Phase 2:** Hash-only lookup (`apikeyhash:${sha256_hex}`)
+
+> ⚠️ **Current Reality:** Production is Phase 1. Code examples in this doc reflect Phase 1 unless marked otherwise.
+
+### 2.6 Database & Publish Contract (Phase 2+)
 
 When the dashboard exists, Postgres is the source of truth:
 
@@ -355,12 +488,20 @@ if (!customer) {
 
 ## 3. AI BOT DETECTION
 
-### 3.1 Canonical Bot List (SOURCE OF TRUTH)
+### 3.1 Bot Detection Source of Truth
 
-> ⚠️ **This is the authoritative bot list.** Middleware SDKs (Section 6) must stay in sync.
-> When updating this list, also update the SDK implementations.
+> ⚠️ **The ONLY canonical bot list lives in `@rosetta/bots`.**
 
-```javascript
+| Component | Requirement |
+|-----------|-------------|
+| Worker (`worker/index.js`) | MUST import from `@rosetta/bots` |
+| Vercel middleware (`@rosetta/vercel`) | MUST import from `@rosetta/bots` |
+| Express middleware (`@rosetta/express`) | MUST import from `@rosetta/bots` |
+
+**Inline bot arrays are FORBIDDEN** unless bundle constraints exist AND are explicitly documented.
+
+```typescript
+// packages/bots/index.ts — THE source of truth
 // AI CRAWLERS ONLY
 // These bots fetch content for AI training or AI-powered search.
 // They benefit from clean markdown.
@@ -370,7 +511,7 @@ if (!customer) {
 // - SEO crawlers (need real HTML): ahrefsbot, screaming frog
 // - Regular search engines (execute JS): googlebot, bingbot
 
-const AI_BOTS = [
+export const AI_BOTS = [
   // OpenAI
   'gptbot',              // Training crawler
   'chatgpt-user',        // Real-time browsing/search
@@ -410,23 +551,35 @@ const AI_BOTS = [
 
   // Diffbot
   'diffbot',             // Extraction / training
-];
-```
+] as const;
 
-### 3.2 Detection Function
-```javascript
-function isAIBot(ua) {
+export function isAIBot(ua: string | null): boolean {
   if (!ua) return false;
   const lower = ua.toLowerCase();
   return AI_BOTS.some(bot => lower.includes(bot));
 }
 ```
 
+### 3.2 Usage Pattern
+
+```typescript
+// ✅ Correct: Import from shared package
+import { isAIBot, AI_BOTS } from '@rosetta/bots';
+
+// ❌ FORBIDDEN: Inline bot arrays
+const AI_BOTS = ['gptbot', 'claudebot', ...];  // NO! This will drift.
+```
+
+> **Note:** Even if `@rosetta/bots` is not yet implemented, documenting it as the source of truth makes any inline copy a spec violation rather than "oops we forgot".
+
 ---
 
 ## 4. CORE REQUEST FLOW
 
-### 4.1 API Handler Pattern
+### 4.1 API Handler Pattern (Phase 1)
+
+> This example reflects **Phase 1** (plaintext token lookup). See Section 2.5 for phase definitions.
+
 ```javascript
 // GET /render?url=X
 // Header: X-Rosetta-Token: sk_xxx
@@ -437,10 +590,11 @@ const CANON_VERSION = 'v1';
 async function handleRender(request, env, ctx) {
   const requestId = request.headers.get('cf-ray') || crypto.randomUUID();
 
-  // 1. Auth
+  // 1. Auth (Phase 1: plaintext token lookup)
   const token = request.headers.get('X-Rosetta-Token');
   if (!token) return json({ error: 'Missing token', requestId }, 401);
   
+  // Phase 1: plaintext lookup. See Section 2.5 for Phase 2 (hash-based) migration.
   const customer = await env.KV.get(`apikey:${token}`, 'json');
   if (!customer) return json({ error: 'Invalid token', requestId }, 401);
 
@@ -589,15 +743,30 @@ function canonicalize(url) {
 > increment the version. Old cache entries become unreachable and expire naturally.
 > This prevents mysterious cache behavior during rollouts.
 
-### 5.2 SSRF Mitigation (v1)
+### 5.2 SSRF Reality (Phase 1)
 
-> ⚠️ **Known limitations of v1 implementation:**
-> - Does not resolve DNS to check for private IPs (DNS rebinding possible)
-> - Does not block IPv6 private ranges
-> - Does not block cloud metadata endpoints (169.254.169.254)
-> 
-> Acceptable for Phase 1: Customer domains are pre-registered and trusted.
-> Harden in Phase 2 if serving untrusted URLs.
+> ⚠️ **Be honest about what we actually protect against.**
+
+In Phase 1, SSRF protection is **effectively achieved via:**
+
+1. **Domain allowlist enforcement** — The real protection. We only fetch URLs from pre-registered customer domains.
+2. **Basic IP literal blocking** — Catches `https://127.0.0.1/...` style URLs.
+3. **Private hostname blocking** — Catches `localhost`, `.local`, `.internal`.
+
+**Known Limitations (accepted in Phase 1):**
+
+| Gap | Impact | Mitigation |
+|-----|--------|------------|
+| DNS resolution NOT checked | DNS rebinding possible | Domain allowlist is pre-registered |
+| IPv6 private ranges incomplete | IPv6 attacks possible | Domain allowlist is pre-registered |
+| Cloud metadata (169.254.169.254) | Not blocked by hostname check | Domain allowlist is pre-registered |
+
+**Why this is acceptable:** We ONLY allow pre-registered customer domains. Customers cannot request arbitrary URLs.
+
+**Phase 2 hardening (if we ever allow arbitrary URLs):**
+- Resolve DNS and check resolved IP against private ranges
+- Block cloud metadata IPs explicitly
+- Add IPv6 private range blocking
 
 ```javascript
 const PRIVATE_IP_PATTERNS = [
@@ -614,6 +783,8 @@ function isPrivateHost(hostname) {
   if (lower === 'localhost' || lower.endsWith('.local') || lower.endsWith('.internal')) {
     return true;
   }
+  // NOTE: This only catches literal IP hostnames, not DNS-resolved IPs.
+  // Real SSRF protection comes from domain allowlist.
   return PRIVATE_IP_PATTERNS.some(p => p.test(hostname));
 }
 ```
@@ -624,27 +795,12 @@ function isPrivateHost(hostname) {
 
 ### 6.1 Vercel Middleware
 
-> ⚠️ **Bot list must stay in sync with Section 3.1.** Import from shared package when available.
+> ⚠️ **Bot detection MUST import from `@rosetta/bots`.** See Section 3.1.
 
 ```typescript
 // packages/vercel/index.ts
 import { NextResponse } from 'next/server';
-
-// Sync with Section 3.1 — this is a copy for bundle size reasons
-const AI_BOTS = [
-  'gptbot', 'chatgpt-user', 'oai-searchbot',
-  'claudebot', 'claude-web',
-  'google-extended', 'googleother',
-  'bingpreview',
-  'perplexitybot', 'amazonbot', 'applebot-extended',
-  'meta-externalagent', 'cohere-ai', 'bytespider', 'ccbot', 'diffbot',
-];
-
-function isAIBot(ua: string | null): boolean {
-  if (!ua) return false;
-  const lower = ua.toLowerCase();
-  return AI_BOTS.some(bot => lower.includes(bot));
-}
+import { isAIBot } from '@rosetta/bots';
 
 export function createMiddleware(token: string) {
   return async function middleware(req: Request) {
@@ -664,7 +820,7 @@ export function createMiddleware(token: string) {
       );
 
       if (!res.ok) {
-        console.error(`[Rosetta] ${res.status} for ${req.url}`);
+        // Log error but don't break the site
         return NextResponse.next(); // Fallback to origin
       }
 
@@ -675,8 +831,7 @@ export function createMiddleware(token: string) {
           'X-Rosetta-Status': res.headers.get('X-Rosetta-Status') || 'unknown',
         },
       });
-    } catch (err) {
-      console.error(`[Rosetta] Error:`, err);
+    } catch {
       return NextResponse.next(); // Never break the site
     }
   };
@@ -807,9 +962,24 @@ async function extractPage(url: string): Promise<string> {
 | Constants | SCREAMING_SNAKE | `AI_BOTS`, `CACHE_TTL`, `PRIVATE_IP_PATTERNS` |
 | KV keys | prefix:identifier | `md:${hash}`, `apikey:${token}` |
 
-### 8.4 Observability Invariant
+### 8.4 Logging Invariant
 
-Every request must emit a structured log entry:
+> ⚠️ **All logging MUST go through the `Logger` class. Direct `console.log` is FORBIDDEN.**
+
+The worker has a `Logger` class that handles structured logging. Use it.
+
+```typescript
+// ✅ Correct: Use Logger
+const logger = new Logger(request, ctx);
+logger.info('Cache hit', { urlHash });
+logger.error('Extraction failed', error);
+logger.flush();  // Emits structured JSON at request end
+
+// ❌ FORBIDDEN: Direct console.log
+console.log('Debug:', url);  // NO! Unstructured, violates privacy rules.
+```
+
+**RequestLog Schema (emitted by Logger):**
 
 ```typescript
 interface RequestLog {
@@ -826,7 +996,6 @@ interface RequestLog {
 
 **Rules:**
 - Do NOT log full URLs unless explicitly enabled per-customer (PII risk)
-- Use `console.log(JSON.stringify(entry))` — Workers logs are JSON-friendly
 - Include `requestId` in all error responses for customer debugging
 - `status` is the canonical outcome field; don't add redundant booleans
 
@@ -859,7 +1028,7 @@ Before outputting code, verify:
 - [ ] No `any` types
 - [ ] All functions have explicit return types
 - [ ] Error handling uses Result<T> internally
-- [ ] No console.log (use structured logging)
+- [ ] No direct console.log (all logging via Logger class)
 - [ ] Crawler responses are always 200
 - [ ] Domain allowlist checked before any fetch
 - [ ] Private IPs blocked
@@ -994,7 +1163,7 @@ AI bots (GPTBot, ClaudeBot):
 Add when Phase 1 breaks:
 - CF Queues for async extraction
 - R2 for cold storage
-- Webhook invalidation
+- Cache invalidation API
 - **Best-effort rate limiting via KV counters (soft limits only)**
 
 > **Rate limiting semantics:** KV is eventually consistent. KV-based counters 
@@ -1002,6 +1171,31 @@ Add when Phase 1 breaks:
 > Acceptable for preventing runaway usage, not for billing enforcement.
 > 
 > **Enterprise / strict enforcement:** Use Durable Objects for exact counting.
+
+#### 13.1.1 Cache Invalidation API (Phase 2 Requirement)
+
+Customers MUST have a way to invalidate cache on-demand. Without this, content updates can take up to 24h to propagate to AI crawlers.
+
+**Implementation:**
+
+1. Define `WebhookPayload` type:
+```typescript
+interface InvalidatePayload {
+  url: string;           // URL to invalidate
+  signature: string;     // HMAC-SHA256(url + timestamp, customerSecret)
+  timestamp: string;     // ISO timestamp (reject if >5min old)
+}
+```
+
+2. Add `POST /_rosetta/invalidate` route to worker
+3. Validate HMAC signature (per-customer secret)
+4. Canonicalize URL → compute hash
+5. Delete `md:${hash}` from KV
+6. Return `200 { status: 'ok', urlHash }`
+
+**Dashboard integration:**
+- "Re-crawl URL" button calls internal invalidate API
+- Batch invalidation for path patterns (future)
 
 ### Phase 3: Margin (500+ customers)
 ```
