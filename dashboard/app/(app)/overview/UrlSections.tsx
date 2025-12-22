@@ -4,11 +4,13 @@ import * as React from "react";
 import {
   ChevronDown,
   ChevronRight,
-  ExternalLink,
   FileText,
   Folder,
+  Loader2,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { Button } from "@/components/ui/button";
+import { checkUrlTokens } from "./actions";
 
 type UrlGroup = {
   section: string;
@@ -73,15 +75,31 @@ function pathnameFromUrl(url: string): string {
   }
 }
 
+type TokenMetrics = {
+  url: string;
+  htmlTokens: number | null;
+  mdTokens: number | null;
+  optimizedAt: Date;
+};
+
+function formatTokenSavings(htmlTokens: number | null, mdTokens: number | null): string {
+  if (!htmlTokens || !mdTokens || htmlTokens === 0) return "—";
+  const savings = ((htmlTokens - mdTokens) / htmlTokens) * 100;
+  return `${Math.round(savings)}%`;
+}
+
 export function UrlSections({
   urls,
   domainLabel,
+  metricsMap,
 }: {
   urls: string[];
   domainLabel?: string | null;
+  metricsMap?: Map<string, TokenMetrics>;
 }) {
   const groups = groupUrlsBySection(urls);
   const [expanded, setExpanded] = React.useState<Set<string>>(() => new Set());
+  const [checkingUrls, setCheckingUrls] = React.useState<Set<string>>(new Set());
 
   React.useEffect(() => {
     setExpanded((prev) => {
@@ -121,9 +139,12 @@ export function UrlSections({
       </div>
 
       {/* Column headers */}
-      <div className="grid grid-cols-[1fr_84px] gap-4 px-4 py-2 bg-muted border-b border-border text-xs text-muted-foreground font-mono">
+      <div className="grid grid-cols-[1fr_100px_140px_120px_100px] gap-4 px-4 py-2 bg-muted border-b border-border text-xs text-muted-foreground font-mono">
         <span>Page</span>
-        <span className="text-right">Open</span>
+        <span className="text-right">Status</span>
+        <span className="text-right">Last Optimized</span>
+        <span className="text-right">Token Savings</span>
+        <span className="text-right">Check</span>
       </div>
 
       {/* File list */}
@@ -136,26 +157,83 @@ export function UrlSections({
           if (!isFolder) {
             const url = group.urls[0];
             const path = pathnameFromUrl(url);
+            const metrics = metricsMap?.get(url);
+            const savings = metrics ? formatTokenSavings(metrics.htmlTokens, metrics.mdTokens) : "—";
+            const optimizedAt = metrics?.optimizedAt 
+              ? new Date(metrics.optimizedAt).toLocaleDateString()
+              : "Never";
+            const status = metrics ? "Optimized" : "Not checked";
+            const isChecking = checkingUrls.has(url);
+            
+            const handleCheck = async (e: React.MouseEvent) => {
+              e.preventDefault();
+              e.stopPropagation();
+              setCheckingUrls((prev) => new Set(prev).add(url));
+              try {
+                const result = await checkUrlTokens(url);
+                if (!result.ok) {
+                  alert(`Failed to check URL: ${result.error}`);
+                  return;
+                }
+                // Refresh the page to show updated metrics
+                window.location.reload();
+              } catch (error) {
+                console.error("Failed to check URL:", error);
+                alert(`Failed to check URL: ${error instanceof Error ? error.message : "Unknown error"}`);
+              } finally {
+                setCheckingUrls((prev) => {
+                  const next = new Set(prev);
+                  next.delete(url);
+                  return next;
+                });
+              }
+            };
+            
             return (
-              <a
+              <div
                 key={group.section}
-                href={url}
-                target="_blank"
-                rel="noreferrer"
-                className="grid grid-cols-[1fr_84px] gap-4 px-4 py-3 hover:bg-[var(--bg-hover)] transition-colors group items-center"
+                className="grid grid-cols-[1fr_100px_140px_120px_100px] gap-4 px-4 py-3 hover:bg-[var(--bg-hover)] transition-colors group items-center"
               >
-                <div className="flex items-center gap-3 min-w-0 pl-2">
+                <a
+                  href={url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="flex items-center gap-3 min-w-0 pl-2"
+                >
                   <FileText className="h-4 w-4 text-muted-foreground flex-shrink-0" />
                   <div className="min-w-0 truncate">
                     <span className="font-mono text-sm text-foreground group-hover:text-accent transition-colors">
                       {path}
                     </span>
                   </div>
+                </a>
+                <div className="flex justify-end">
+                  <span className="text-xs text-muted-foreground font-mono">{status}</span>
                 </div>
                 <div className="flex justify-end">
-                  <ExternalLink className="h-4 w-4 text-muted-foreground group-hover:text-foreground transition-colors" />
+                  <span className="text-xs text-muted-foreground font-mono">{optimizedAt}</span>
                 </div>
-              </a>
+                <div className="flex justify-end">
+                  <span className={`text-xs font-mono ${savings !== "—" ? "text-green-600 dark:text-green-400" : "text-muted-foreground"}`}>
+                    {savings}
+                  </span>
+                </div>
+                <div className="flex justify-end">
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={handleCheck}
+                    disabled={isChecking}
+                    className="h-7 px-2 text-xs"
+                  >
+                    {isChecking ? (
+                      <Loader2 className="h-3 w-3 animate-spin" />
+                    ) : (
+                      "Check"
+                    )}
+                  </Button>
+                </div>
+              </div>
             );
           }
 
@@ -173,7 +251,7 @@ export function UrlSections({
                   });
                 }}
                 className={cn(
-                  "w-full grid grid-cols-[1fr_84px] gap-4 px-4 py-3 hover:bg-[var(--bg-hover)] transition-colors group items-center text-left",
+                  "w-full grid grid-cols-[1fr_100px_140px_120px_100px] gap-4 px-4 py-3 hover:bg-[var(--bg-hover)] transition-colors group items-center text-left",
                 )}
               >
                 <div className="flex items-center gap-2 min-w-0">
@@ -193,6 +271,15 @@ export function UrlSections({
                 <span className="text-right text-xs text-muted-foreground font-mono tabular-nums">
                   —
                 </span>
+                <span className="text-right text-xs text-muted-foreground font-mono tabular-nums">
+                  —
+                </span>
+                <span className="text-right text-xs text-muted-foreground font-mono tabular-nums">
+                  —
+                </span>
+                <span className="text-right text-xs text-muted-foreground font-mono tabular-nums">
+                  —
+                </span>
               </button>
 
               {/* Expanded folder contents */}
@@ -201,15 +288,49 @@ export function UrlSections({
                   {group.urls.map((url) => {
                     const path = pathnameFromUrl(url);
                     const fileName = path.split("/").filter(Boolean).pop() || path;
+                    const metrics = metricsMap?.get(url);
+                    const savings = metrics ? formatTokenSavings(metrics.htmlTokens, metrics.mdTokens) : "—";
+                    const optimizedAt = metrics?.optimizedAt 
+                      ? new Date(metrics.optimizedAt).toLocaleDateString()
+                      : "Never";
+                    const status = metrics ? "Optimized" : "Not checked";
+                    const isChecking = checkingUrls.has(url);
+                    
+                    const handleCheck = async (e: React.MouseEvent) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      setCheckingUrls((prev) => new Set(prev).add(url));
+                      try {
+                        const result = await checkUrlTokens(url);
+                        if (!result.ok) {
+                          alert(`Failed to check URL: ${result.error}`);
+                          return;
+                        }
+                        // Refresh the page to show updated metrics
+                        window.location.reload();
+                      } catch (error) {
+                        console.error("Failed to check URL:", error);
+                        alert(`Failed to check URL: ${error instanceof Error ? error.message : "Unknown error"}`);
+                      } finally {
+                        setCheckingUrls((prev) => {
+                          const next = new Set(prev);
+                          next.delete(url);
+                          return next;
+                        });
+                      }
+                    };
+                    
                     return (
-                      <a
+                      <div
                         key={url}
-                        href={url}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="grid grid-cols-[1fr_84px] gap-4 px-4 py-2 hover:bg-[var(--bg-hover)] transition-colors group items-center border-t border-border"
+                        className="grid grid-cols-[1fr_100px_140px_120px_100px] gap-4 px-4 py-2 hover:bg-[var(--bg-hover)] transition-colors group items-center border-t border-border"
                       >
-                        <div className="flex items-center gap-3 min-w-0 pl-10">
+                        <a
+                          href={url}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="flex items-center gap-3 min-w-0 pl-10"
+                        >
                           <FileText className="h-4 w-4 text-muted-foreground flex-shrink-0" />
                           <div className="min-w-0 truncate">
                             <span className="font-mono text-sm text-foreground group-hover:text-accent transition-colors">
@@ -219,11 +340,34 @@ export function UrlSections({
                               {path}
                             </span>
                           </div>
+                        </a>
+                        <div className="flex justify-end">
+                          <span className="text-xs text-muted-foreground font-mono">{status}</span>
                         </div>
                         <div className="flex justify-end">
-                          <ExternalLink className="h-4 w-4 text-muted-foreground group-hover:text-foreground transition-colors" />
+                          <span className="text-xs text-muted-foreground font-mono">{optimizedAt}</span>
                         </div>
-                      </a>
+                        <div className="flex justify-end">
+                          <span className={`text-xs font-mono ${savings !== "—" ? "text-green-600 dark:text-green-400" : "text-muted-foreground"}`}>
+                            {savings}
+                          </span>
+                        </div>
+                        <div className="flex justify-end">
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={handleCheck}
+                            disabled={isChecking}
+                            className="h-7 px-2 text-xs"
+                          >
+                            {isChecking ? (
+                              <Loader2 className="h-3 w-3 animate-spin" />
+                            ) : (
+                              "Check"
+                            )}
+                          </Button>
+                        </div>
+                      </div>
                     );
                   })}
                 </div>

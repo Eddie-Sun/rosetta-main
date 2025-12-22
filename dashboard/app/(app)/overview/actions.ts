@@ -241,4 +241,65 @@ export async function removeSeedUrl(formData: FormData): Promise<ActionResult> {
   }
 }
 
+export async function checkUrlTokens(url: string): Promise<ActionResult> {
+  const { userId } = await auth();
+  if (!userId) return err("Not authenticated");
+
+  try {
+    const dataRes = await getCustomerAndPrimaryDomain(userId);
+    if (!dataRes.ok) return err(dataRes.error);
+    const data = dataRes.value;
+
+    // Get customer's API token (first non-revoked token)
+    const apiToken = await prisma.apiToken.findFirst({
+      where: {
+        customerId: data.customer.id,
+        revokedAt: null,
+      },
+      orderBy: { createdAt: "desc" },
+    });
+
+    if (!apiToken) {
+      return err("No API token found. Please create an API token first.");
+    }
+
+    // Get worker API URL from environment
+    const workerApiUrl =
+      process.env.NEXT_PUBLIC_WORKER_API_URL ||
+      process.env.WORKER_API_URL ||
+      "https://api.rosetta.ai";
+
+    // For MVP: Use service token from env, or construct from token prefix
+    // TODO: Store plaintext tokens securely when creating them
+    const serviceToken = process.env.ROSETTA_SERVICE_TOKEN;
+    
+    if (!serviceToken) {
+      return err("Service token not configured. Please set ROSETTA_SERVICE_TOKEN environment variable.");
+    }
+
+    // Call worker API to trigger optimization
+    // This will cause the worker to extract the page, count tokens, and send metrics back
+    const response = await fetch(`${workerApiUrl}/render?url=${encodeURIComponent(url)}`, {
+      method: "GET",
+      headers: {
+        "X-Rosetta-Token": serviceToken,
+      },
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      return err(`Worker API error: ${response.status} ${errorText}`);
+    }
+
+    // Wait a moment for metrics to be processed and sent to dashboard
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+
+    revalidatePath("/overview");
+    return ok(undefined);
+  } catch (error) {
+    console.error("Error checking URL tokens:", error);
+    return err(error instanceof Error ? error.message : "Failed to check URL");
+  }
+}
+
 
