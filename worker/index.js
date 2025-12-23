@@ -1162,28 +1162,44 @@ async function scrapeWithTimeout(targetUrl, apiKey, timeoutMs) {
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const response = await fetch(FIRECRAWL_SCRAPE_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiKey}`
-      },
-      body: JSON.stringify({
-        url: targetUrl,
-        formats: ['markdown', 'html'],
-        onlyMainContent: true,
+    // Fetch raw HTML from origin AND markdown from Firecrawl in parallel
+    // This gives us accurate token savings: raw HTML vs clean markdown
+    const [firecrawlResponse, rawHtmlResponse] = await Promise.all([
+      fetch(FIRECRAWL_SCRAPE_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${apiKey}`
+        },
+        body: JSON.stringify({
+          url: targetUrl,
+          formats: ['markdown'],
+          onlyMainContent: true,
+        }),
+        signal: controller.signal
       }),
-      signal: controller.signal
-    });
+      // Fetch raw HTML directly from origin with browser User-Agent
+      fetch(targetUrl, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        },
+        signal: controller.signal,
+        redirect: 'follow',
+      }).catch((err) => {
+        console.error(`Raw HTML fetch failed for ${targetUrl}:`, err?.message || err);
+        return null;
+      })
+    ]);
 
     clearTimeout(timeout);
 
-    if (!response.ok) {
-      console.error(`Firecrawl API Error: ${response.status}`);
+    if (!firecrawlResponse.ok) {
+      console.error(`Firecrawl API Error: ${firecrawlResponse.status}`);
       return null;
     }
 
-    const json = await response.json();
+    const json = await firecrawlResponse.json();
 
     if (!json.success || !json.data || !json.data.markdown) {
       console.error('Invalid Firecrawl response format');
@@ -1191,14 +1207,30 @@ async function scrapeWithTimeout(targetUrl, apiKey, timeoutMs) {
     }
 
     const md = json.data.markdown;
-    const html = json.data.html || null;
+    
+    // Get raw HTML from origin (for accurate token comparison)
+    let rawHtml = null;
+    if (rawHtmlResponse) {
+      if (rawHtmlResponse.ok) {
+        try {
+          rawHtml = await rawHtmlResponse.text();
+          console.log(`Raw HTML fetched: ${rawHtml.length} bytes from ${targetUrl}`);
+        } catch (err) {
+          console.warn('Failed to read raw HTML response:', err);
+        }
+      } else {
+        console.warn(`Raw HTML fetch returned ${rawHtmlResponse.status} for ${targetUrl}`);
+      }
+    } else {
+      console.warn(`Raw HTML response is null for ${targetUrl}`);
+    }
 
     if (isHTML(md)) {
       console.error('Firecrawl returned HTML instead of Markdown');
       return null;
     }
 
-    return { markdown: md, html };
+    return { markdown: md, html: rawHtml };
   } catch (err) {
     clearTimeout(timeout);
     if (err.name === 'AbortError') {
