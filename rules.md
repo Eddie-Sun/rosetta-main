@@ -320,7 +320,6 @@ This will be required for enterprise security questionnaires.
 
 4. **Bot list changes are NOT breaking.**
    - Adding/removing bots is expected evolution.
-   - SDKs importing from `@rosetta/bots` get updates automatically.
 
 **Deprecation process:**
 1. Announce deprecation (changelog, dashboard notification)
@@ -490,87 +489,13 @@ if (!customer) {
 
 ### 3.1 Bot Detection Source of Truth
 
-> ⚠️ **The ONLY canonical bot list lives in `@rosetta/bots`.**
+The canonical bot list lives in `worker/index.js` (`AI_BOTS` and `isAIBot`).
 
-| Component | Requirement |
-|-----------|-------------|
-| Worker (`worker/index.js`) | MUST import from `@rosetta/bots` |
-| Vercel middleware (`@rosetta/vercel`) | MUST import from `@rosetta/bots` |
-| Express middleware (`@rosetta/express`) | MUST import from `@rosetta/bots` |
+If you update it, you MUST mirror the list into:
+- `packages/vercel/index.ts`
+- `packages/express/index.ts`
 
-**Inline bot arrays are FORBIDDEN** unless bundle constraints exist AND are explicitly documented.
-
-```typescript
-// packages/bots/index.ts — THE source of truth
-// AI CRAWLERS ONLY
-// These bots fetch content for AI training or AI-powered search.
-// They benefit from clean markdown.
-//
-// DO NOT INCLUDE:
-// - Social preview bots (need HTML with OG tags): twitterbot, slackbot
-// - SEO crawlers (need real HTML): ahrefsbot, screaming frog
-// - Regular search engines (execute JS): googlebot, bingbot
-
-export const AI_BOTS = [
-  // OpenAI
-  'gptbot',              // Training crawler
-  'chatgpt-user',        // Real-time browsing/search
-  'oai-searchbot',       // Search indexing
-
-  // Anthropic
-  'claudebot',           // Training crawler
-  'claude-web',          // Real-time search
-
-  // Google AI (NOT regular Googlebot)
-  'google-extended',     // AI training opt-out signal
-  'googleother',         // Non-search crawling
-
-  // Microsoft/Bing AI
-  'bingpreview',         // AI previews (not regular bingbot)
-
-  // Perplexity
-  'perplexitybot',       // Search + training
-
-  // Amazon
-  'amazonbot',           // Alexa / AI training
-
-  // Apple
-  'applebot-extended',   // AI training (Siri)
-
-  // Meta
-  'meta-externalagent',  // AI training
-
-  // Cohere
-  'cohere-ai',           // Training
-
-  // ByteDance
-  'bytespider',          // Training (aggressive)
-
-  // Common Crawl
-  'ccbot',               // Used for AI training datasets
-
-  // Diffbot
-  'diffbot',             // Extraction / training
-] as const;
-
-export function isAIBot(ua: string | null): boolean {
-  if (!ua) return false;
-  const lower = ua.toLowerCase();
-  return AI_BOTS.some(bot => lower.includes(bot));
-}
-```
-
-### 3.2 Usage Pattern
-
-```typescript
-// ✅ Correct: Import from shared package
-import { isAIBot, AI_BOTS } from '@rosetta/bots';
-
-// ❌ FORBIDDEN: Inline bot arrays
-const AI_BOTS = ['gptbot', 'claudebot', ...];  // NO! This will drift.
-```
-
-> **Note:** Even if `@rosetta/bots` is not yet implemented, documenting it as the source of truth makes any inline copy a spec violation rather than "oops we forgot".
+> We may consolidate this into a shared `@rosetta/bots` package later. Until then, drift between worker + SDKs is a correctness risk.
 
 ---
 
@@ -795,12 +720,9 @@ function isPrivateHost(hostname) {
 
 ### 6.1 Vercel Middleware
 
-> ⚠️ **Bot detection MUST import from `@rosetta/bots`.** See Section 3.1.
-
 ```typescript
 // packages/vercel/index.ts
 import { NextResponse } from 'next/server';
-import { isAIBot } from '@rosetta/bots';
 
 export function createMiddleware(token: string) {
   return async function middleware(req: Request) {

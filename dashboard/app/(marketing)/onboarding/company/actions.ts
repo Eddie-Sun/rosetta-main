@@ -2,6 +2,7 @@
 
 import { auth } from "@clerk/nextjs/server";
 import { prisma } from "@/lib/prisma";
+import { syncCustomerAuthToKV } from "@/lib/tokens";
 
 type Result = { ok: true } | { ok: false; error: string };
 
@@ -33,7 +34,7 @@ export async function submitCompanyInfo(
   const hostname = normalizeHostname(domain);
 
   try {
-    await prisma.$transaction(async (tx) => {
+    const customerId = await prisma.$transaction(async (tx) => {
       const customer = await tx.customer.upsert({
         where: { clerkUserId: userId },
         create: {
@@ -60,7 +61,16 @@ export async function submitCompanyInfo(
         },
         update: {},
       });
+
+      return customer.id;
     });
+
+    // Best-effort: keep worker allowlist in sync for existing tokens.
+    try {
+      await syncCustomerAuthToKV(customerId);
+    } catch (e) {
+      console.error("Failed to sync customer auth to KV:", e);
+    }
 
     return { ok: true };
   } catch {

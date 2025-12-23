@@ -50,6 +50,22 @@ export interface CreateTokenResult {
   prefix: string;
 }
 
+async function kvPutWithRetry(key: string, value: string): Promise<void> {
+  const kv = getKV();
+  let lastErr: unknown = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      await kv.put(key, value);
+      return;
+    } catch (e) {
+      lastErr = e;
+      // small backoff
+      await new Promise((r) => setTimeout(r, 250 * attempt));
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error("KV put failed");
+}
+
 export async function createApiTokenForCustomer(
   input: CreateTokenInput
 ): Promise<CreateTokenResult> {
@@ -93,8 +109,11 @@ export async function createApiTokenForCustomer(
   });
 
   try {
-    const kv = getKV();
-    await kv.put(`apikeyhash:${tokenHash}`, JSON.stringify(config));
+    const payload = JSON.stringify(config);
+    // Token auth lookup
+    await kvPutWithRetry(`apikeyhash:${tokenHash}`, payload);
+    // Customer auth lookup (used by internal dashboard→worker checks)
+    await kvPutWithRetry(`customer:${customerId}`, payload);
   } catch {
     await prisma.apiToken.delete({
       where: { id: apiToken.id },
@@ -132,4 +151,34 @@ export async function revokeApiToken(
   } catch (err) {
     console.error("Failed to delete KV entry on revoke:", err);
   }
+}
+
+/**
+ * Sync current customer auth config (plan + domains) to KV for all active tokens.
+ * This is required when domains change so the worker allowlist updates without
+ * forcing users to mint new tokens.
+ */
+export async function syncCustomerAuthToKV(customerId: string): Promise<void> {
+  const customer = await prisma.customer.findUnique({
+    where: { id: customerId },
+    include: {
+      domains: true,
+      apiTokens: { where: { revokedAt: null } },
+    },
+  });
+
+  if (!customer) throw new Error("Customer not found");
+
+  const domains = normalizeDomains(customer.domains.map((d) => d.hostname));
+  const config: CustomerConfigV2 = {
+    v: 2,
+    id: customer.id,
+    plan: customer.plan,
+    domains,
+    updatedAt: new Date().toISOString(),
+  };
+
+  const payload = JSON.stringify(config);
+  await kvPutWithRetry(`customer:${customerId}`, payload);
+  await Promise.all(customer.apiTokens.map((t) => kvPutWithRetry(`apikeyhash:${t.tokenHash}`, payload)));
 }

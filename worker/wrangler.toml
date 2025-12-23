@@ -12,4 +12,7 @@ preview_id = "d52a240e3362426d9e83a20789e2e400"
 # Default config
 FIRECRAWL_API_URL = "https://api.firecrawl.dev/v1/scrape"
 # FIRECRAWL_API_KEY will be set via `wrangler secret put`
+# DASHBOARD_API_KEY will be set via `wrangler secret put`
+# WORKER_INTERNAL_API_KEY will be set via `wrangler secret put` (dashboard -> worker internal auth)
+# DASHBOARD_API_URL = "https://dashboard.rosetta.ai"
 

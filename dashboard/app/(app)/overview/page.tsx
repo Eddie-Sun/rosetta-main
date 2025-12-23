@@ -21,6 +21,10 @@ export default async function Page() {
     redirect("/onboarding/company");
   }
 
+  // #region agent log
+  fetch('http://127.0.0.1:7244/ingest/574fd32f-9942-40f1-96d6-0e10426324d4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'debug-session',runId:'pre-fix',hypothesisId:'H4',location:'dashboard/app/(app)/overview/page.tsx:customer',message:'overview page loaded customer',data:{customerId:customer.id,domainCount:customer.domains.length},timestamp:Date.now()})}).catch(()=>{});
+  // #endregion agent log
+
   const domain = customer.domains[0] ?? null;
 
   if (domain) {
@@ -55,6 +59,10 @@ export default async function Page() {
           where: { customerId: customer.id, url: { in: mapUrls } },
           select: { url: true, htmlTokens: true, mdTokens: true, optimizedAt: true },
         });
+
+  // #region agent log
+  fetch('http://127.0.0.1:7244/ingest/574fd32f-9942-40f1-96d6-0e10426324d4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'debug-session',runId:'pre-fix',hypothesisId:'H3',location:'dashboard/app/(app)/overview/page.tsx:metrics',message:'overview metrics fetched',data:{mapUrlsCount:mapUrls.length,urlMetricsCount:urlMetrics.length,sampleMapUrl:mapUrls[0]||null,sampleMetricUrl:urlMetrics[0]?.url||null},timestamp:Date.now()})}).catch(()=>{});
+  // #endregion agent log
 
   const metricsMap = new Map(urlMetrics.map((m) => [m.url, m]));
 

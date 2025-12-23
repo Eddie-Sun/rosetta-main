@@ -29,7 +29,7 @@ const CACHE_TTL = 86400; // 24 hours (safer default to avoid stale content)
 const EXTRACT_TIMEOUT_MS = 3000; // 3 seconds (increased from 2s)
 const PENDING_TTL = 30; // Single-flight marker TTL
 const MAX_CRAWL_PAGES = 100;
-const DASHBOARD_API_URL = "https://dashboard.rosetta.ai"; // Will be configurable via env var
+const DASHBOARD_API_URL = "https://dashboard.rosetta.ai";
 
 // SSRF protection: block private/internal IP ranges
 const PRIVATE_IP_PATTERNS = [
@@ -203,6 +203,11 @@ export default {
       return handleRenderAPI(request, url, env, ctx);
     }
 
+    // --- INTERNAL API MODE: GET /render/internal?customerId=...&url=... (service-auth) ---
+    if (url.pathname === '/render/internal') {
+      return handleRenderInternal(request, url, env, ctx);
+    }
+
     // --- CRAWL API ROUTES (with auth) ---
     if (url.pathname === '/_rosetta/crawl' && request.method === 'POST') {
       return handleCrawlStart(request, env, ctx);
@@ -217,6 +222,191 @@ export default {
     return handleProxyMode(request, url, env, ctx);
   }
 };
+
+// =============================================================================
+// INTERNAL API MODE HANDLER - GET /render/internal?customerId=...&url=...
+// Uses customer:<id> config in KV so the dashboard can trigger checks without
+// storing plaintext customer tokens server-side.
+// =============================================================================
+
+async function handleRenderInternal(request, url, env, ctx) {
+  const logger = new Logger(request, ctx);
+
+  try {
+    const expected = env.WORKER_INTERNAL_API_KEY;
+    const auth = request.headers.get('Authorization');
+    if (!expected || auth !== `Bearer ${expected}`) {
+      return jsonResponse({ error: 'Unauthorized' }, 401);
+    }
+
+    const customerId = url.searchParams.get('customerId');
+    const targetUrl = url.searchParams.get('url');
+    if (!customerId) return jsonResponse({ error: 'Missing customerId parameter' }, 400);
+    if (!targetUrl) return jsonResponse({ error: 'Missing url parameter' }, 400);
+
+    let parsed;
+    try {
+      parsed = new URL(targetUrl);
+    } catch {
+      return jsonResponse({ error: 'Invalid URL format' }, 400);
+    }
+    if (parsed.protocol !== 'https:') {
+      return jsonResponse({ error: 'URL must use https' }, 400);
+    }
+    if (isPrivateHost(parsed.hostname)) {
+      return jsonResponse({ error: 'Private/internal addresses not allowed' }, 400);
+    }
+
+    let customer;
+    try {
+      customer = await env.ROSETTA_CACHE.get(`customer:${customerId}`, 'json');
+    } catch (err) {
+      logger.error('KV customer config lookup failed', err);
+      return jsonResponse({ error: 'Auth service unavailable' }, 503);
+    }
+
+    if (!customer) {
+      return jsonResponse({ error: 'Customer config not found' }, 404);
+    }
+
+    // Domain allowlist check (match dashboard normalization; strips www for allowlist)
+    const hostname = parsed.hostname.toLowerCase().replace(/^www\./, '');
+    if (!customer.domains || !customer.domains.includes(hostname)) {
+      return jsonResponse({ error: `Domain '${hostname}' not in allowlist` }, 403);
+    }
+
+    // Reuse the same extraction/cache logic as /render, but skip token auth.
+    const canonical = canonicalize(targetUrl);
+    const hash = await sha256(canonical);
+
+    const cacheKey = `md:${hash}`;
+    const tokensKey = `tokens:${hash}`;
+    let cached = null;
+    try {
+      cached = await env.ROSETTA_CACHE.get(cacheKey);
+    } catch (err) {
+      logger.error('KV cache read failed', err);
+    }
+
+    if (cached && !isHTML(cached)) {
+      // Internal endpoint is for dashboard-triggered checks; return structured status
+      // + token counts so the dashboard can update UI deterministically even if
+      // the worker cannot callback into the dashboard environment.
+      let htmlTokens = null;
+      let mdTokens = estimateTokens(cached);
+      try {
+        const cachedTokens = await env.ROSETTA_CACHE.get(tokensKey, 'json');
+        if (cachedTokens && typeof cachedTokens === 'object') {
+          const ht = cachedTokens.htmlTokens;
+          const mt = cachedTokens.mdTokens;
+          if (typeof ht === 'number') htmlTokens = ht;
+          if (typeof mt === 'number') mdTokens = mt;
+        }
+      } catch (err) {
+        logger.error('KV tokens read failed', err);
+      }
+      logger.setCacheStatus('HIT');
+      logger.meta.status = 200;
+      ctx.waitUntil(Promise.resolve(logger.flush()));
+      return jsonResponse({ ok: true, cacheStatus: 'HIT', canonical, htmlTokens, mdTokens }, 200);
+    }
+
+    const pendingKey = `pending:${hash}`;
+    let pending = null;
+    try {
+      pending = await env.ROSETTA_CACHE.get(pendingKey);
+    } catch (err) {
+      logger.error('KV pending read failed', err);
+    }
+
+    if (pending) {
+      for (let i = 0; i < 6; i++) {
+        await sleep(500);
+        try {
+          const md = await env.ROSETTA_CACHE.get(cacheKey);
+          if (md && !isHTML(md)) {
+            logger.setCacheStatus('HIT');
+            logger.meta.status = 200;
+            ctx.waitUntil(Promise.resolve(logger.flush()));
+            return jsonResponse(
+              {
+                ok: true,
+                cacheStatus: 'HIT',
+                canonical,
+                htmlTokens: null,
+                mdTokens: estimateTokens(md)
+              },
+              200
+            );
+          }
+        } catch (err) {
+          logger.error('KV poll read failed', err);
+        }
+      }
+    }
+
+    try {
+      await env.ROSETTA_CACHE.put(pendingKey, Date.now().toString(), { expirationTtl: PENDING_TTL });
+    } catch (err) {
+      logger.error('KV pending write failed', err);
+    }
+
+    try {
+      const scrapeResult = await scrapeWithTimeout(canonical, env.FIRECRAWL_API_KEY, EXTRACT_TIMEOUT_MS);
+      if (scrapeResult && scrapeResult.markdown) {
+        const md = scrapeResult.markdown;
+        const html = scrapeResult.html;
+
+        ctx.waitUntil(
+          env.ROSETTA_CACHE.put(cacheKey, md, { expirationTtl: CACHE_TTL })
+            .catch(err => logger.error('KV cache write failed', err))
+        );
+        ctx.waitUntil(
+          env.ROSETTA_CACHE.delete(pendingKey)
+            .catch(err => logger.error('KV pending delete failed', err))
+        );
+
+        // Token metrics (computed here; callback is best-effort)
+        const htmlTokens = html ? estimateTokens(html) : null;
+        const mdTokens = estimateTokens(md);
+        if (htmlTokens !== null) {
+          ctx.waitUntil(
+            sendTokenMetrics(env, customerId, canonical, htmlTokens, mdTokens)
+              .catch(err => logger.error('Token metrics send failed', err))
+          );
+        }
+        // Cache token counts so future internal HITs can still return savings.
+        ctx.waitUntil(
+          env.ROSETTA_CACHE.put(tokensKey, JSON.stringify({ htmlTokens, mdTokens, ts: Date.now() }), { expirationTtl: CACHE_TTL })
+            .catch(err => logger.error('KV tokens write failed', err))
+        );
+
+        logger.setCacheStatus('MISS');
+        logger.meta.status = 200;
+        ctx.waitUntil(Promise.resolve(logger.flush()));
+        return jsonResponse(
+          { ok: true, cacheStatus: 'MISS', canonical, htmlTokens, mdTokens },
+          200
+        );
+      }
+    } catch (err) {
+      logger.error('Extract failed', err);
+    }
+
+    ctx.waitUntil(
+      env.ROSETTA_CACHE.delete(pendingKey)
+        .catch(err => logger.error('KV pending delete failed', err))
+    );
+
+    const fallback = await fetchFallback(canonical, request);
+    logger.meta.status = fallback.status;
+    ctx.waitUntil(Promise.resolve(logger.flush()));
+    return fallback;
+  } catch (err) {
+    logger.error('Unhandled internal API error', err);
+    return jsonResponse({ error: 'Internal Server Error', requestId: logger.requestId }, 500);
+  }
+}
 
 // =============================================================================
 // OBSERVABILITY & LOGGING
@@ -330,12 +520,10 @@ async function _handleRenderLogic(request, url, env, ctx, logger) {
 
   let customer;
   try {
-    // Phase 1.5: Dual lookup (hash first, then plaintext fallback)
     const tokenHash = await sha256(token);
     customer = await env.ROSETTA_CACHE.get(`apikeyhash:${tokenHash}`, 'json');
-    
+
     if (!customer) {
-      // Legacy fallback: plaintext token lookup (for ROSETTA_SERVICE_TOKEN / manual provisioning)
       customer = await env.ROSETTA_CACHE.get(`apikey:${token}`, 'json');
     }
   } catch (err) {
@@ -347,7 +535,6 @@ async function _handleRenderLogic(request, url, env, ctx, logger) {
     return jsonResponse({ error: 'Invalid API token' }, 401);
   }
 
-  // Handle both legacy format (id) and V2 format (id field)
   const customerId = customer.id || customer.customerId;
   if (!customerId) {
     return jsonResponse({ error: 'Invalid customer config format' }, 500);
@@ -675,12 +862,10 @@ async function handleCrawlStart(request, env, ctx) {
 
   let customer;
   try {
-    // Phase 1.5: Dual lookup (hash first, then plaintext fallback)
     const tokenHash = await sha256(token);
     customer = await env.ROSETTA_CACHE.get(`apikeyhash:${tokenHash}`, 'json');
-    
+
     if (!customer) {
-      // Legacy fallback: plaintext token lookup
       customer = await env.ROSETTA_CACHE.get(`apikey:${token}`, 'json');
     }
   } catch (err) {
@@ -692,7 +877,6 @@ async function handleCrawlStart(request, env, ctx) {
     return jsonResponse({ error: 'Invalid API token' }, 401);
   }
 
-  // Handle both legacy format (id) and V2 format (id field)
   const customerId = customer.id || customer.customerId;
   if (!customerId) {
     return jsonResponse({ error: 'Invalid customer config format' }, 500);
@@ -809,12 +993,10 @@ async function handleCrawlStatus(crawlId, request, env, ctx) {
 
   let customer;
   try {
-    // Phase 1.5: Dual lookup (hash first, then plaintext fallback)
     const tokenHash = await sha256(token);
     customer = await env.ROSETTA_CACHE.get(`apikeyhash:${tokenHash}`, 'json');
-    
+
     if (!customer) {
-      // Legacy fallback: plaintext token lookup
       customer = await env.ROSETTA_CACHE.get(`apikey:${token}`, 'json');
     }
   } catch (err) {
@@ -826,7 +1008,6 @@ async function handleCrawlStatus(crawlId, request, env, ctx) {
     return jsonResponse({ error: 'Invalid API token' }, 401);
   }
 
-  // Handle both legacy format (id) and V2 format (id field)
   const customerId = customer.id || customer.customerId;
   if (!customerId) {
     return jsonResponse({ error: 'Invalid customer config format' }, 500);
@@ -924,7 +1105,11 @@ async function handleCrawlStatus(crawlId, request, env, ctx) {
 function canonicalize(urlString) {
   const parsed = new URL(urlString);
   parsed.hash = '';
-  parsed.hostname = parsed.hostname.toLowerCase().replace(/^www\./, '');
+  // IMPORTANT:
+  // Do NOT strip `www.` here. Some sites (including many Next.js deployments) serve
+  // different content (or even 404) on apex vs www. We want to fetch/scrape the
+  // exact host the user requested.
+  parsed.hostname = parsed.hostname.toLowerCase();
 
   // Remove tracking params
   for (const param of TRACKING_PARAMS) {
@@ -967,18 +1152,8 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-/**
- * Scrape with Firecrawl (with timeout)
- */
-/**
- * Estimate token count using simple character-based approximation
- * ~4 characters per token is a reasonable estimate for English text
- * This is a fallback - ideally use a proper tokenizer if available
- */
 function estimateTokens(text) {
   if (!text) return 0;
-  // Rough estimate: ~4 chars per token for English
-  // More accurate would require a tokenizer library
   return Math.ceil(text.length / 4);
 }
 
@@ -995,7 +1170,7 @@ async function scrapeWithTimeout(targetUrl, apiKey, timeoutMs) {
       },
       body: JSON.stringify({
         url: targetUrl,
-        formats: ['markdown', 'html'], // Request both for token comparison
+        formats: ['markdown', 'html'],
         onlyMainContent: true,
       }),
       signal: controller.signal
@@ -1018,7 +1193,6 @@ async function scrapeWithTimeout(targetUrl, apiKey, timeoutMs) {
     const md = json.data.markdown;
     const html = json.data.html || null;
 
-    // Reject if Firecrawl returned HTML instead of Markdown
     if (isHTML(md)) {
       console.error('Firecrawl returned HTML instead of Markdown');
       return null;
@@ -1131,12 +1305,9 @@ async function incrementUsage(env, customerId) {
   }
 }
 
-/**
- * Send token metrics to dashboard API
- * Fire and forget - don't block response
- */
 async function sendTokenMetrics(env, customerId, url, htmlTokens, mdTokens) {
   try {
+    if (!env.DASHBOARD_API_KEY) return;
     const dashboardUrl = env.DASHBOARD_API_URL || DASHBOARD_API_URL;
     const apiUrl = `${dashboardUrl}/api/metrics/tokens`;
 
@@ -1144,7 +1315,7 @@ async function sendTokenMetrics(env, customerId, url, htmlTokens, mdTokens) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${env.DASHBOARD_API_KEY || ''}`, // Optional API key for auth
+        'Authorization': `Bearer ${env.DASHBOARD_API_KEY}`,
       },
       body: JSON.stringify({
         customerId,
@@ -1155,7 +1326,6 @@ async function sendTokenMetrics(env, customerId, url, htmlTokens, mdTokens) {
       }),
     });
   } catch (err) {
-    // Silently fail - metrics are best effort
     console.error('Failed to send token metrics:', err);
   }
 }

@@ -243,32 +243,102 @@ export async function checkUrlTokens(url: string): Promise<ActionResult> {
   if (!userId) return err("Not authenticated");
 
   try {
+    // #region agent log
+    fetch('http://127.0.0.1:7244/ingest/574fd32f-9942-40f1-96d6-0e10426324d4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'debug-session',runId:'pre-fix',hypothesisId:'H1',location:'dashboard/app/(app)/overview/actions.ts:checkUrlTokens:entry',message:'checkUrlTokens called',data:{url},timestamp:Date.now()})}).catch(()=>{});
+    // #endregion agent log
+
     const dataRes = await getCustomerAndPrimaryDomain(userId);
     if (!dataRes.ok) return err(dataRes.error);
     const data = dataRes.value;
 
-    const workerApiUrl = process.env.WORKER_API_URL || "https://api.rosetta.ai";
-    const serviceToken = process.env.ROSETTA_SERVICE_TOKEN;
+    const workerApiUrlRaw =
+      process.env.NEXT_PUBLIC_WORKER_API_URL ||
+      process.env.WORKER_API_URL ||
+      "https://api.rosetta.ai";
+    const workerApiUrl = workerApiUrlRaw.replace(/\/+$/, "");
+    const internalKey = process.env.WORKER_INTERNAL_API_KEY;
 
-    if (!serviceToken) {
-      return err("ROSETTA_SERVICE_TOKEN is not set.");
+    if (!internalKey) {
+      return err("WORKER_INTERNAL_API_KEY is not set.");
     }
 
-    const response = await fetch(`${workerApiUrl}/render?url=${encodeURIComponent(url)}`, {
+    const endpoint = `${workerApiUrl}/render/internal?customerId=${encodeURIComponent(
+      data.customer.id
+    )}&url=${encodeURIComponent(url)}`;
+
+    // #region agent log
+    fetch('http://127.0.0.1:7244/ingest/574fd32f-9942-40f1-96d6-0e10426324d4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'debug-session',runId:'pre-fix',hypothesisId:'H1',location:'dashboard/app/(app)/overview/actions.ts:checkUrlTokens:beforeFetch',message:'Calling worker internal render',data:{endpoint,hasInternalKey:true,customerId:data.customer.id},timestamp:Date.now()})}).catch(()=>{});
+    // #endregion agent log
+
+    const response = await fetch(endpoint, {
       method: "GET",
       headers: {
-        "X-Rosetta-Token": serviceToken,
+        Authorization: `Bearer ${internalKey}`,
       },
     });
 
     if (!response.ok) {
-      return err(`Worker API error: ${response.status}`);
+      let details = "";
+      try {
+        const text = await response.text();
+        details = text ? `: ${text.slice(0, 300)}` : "";
+      } catch {
+        // ignore
+      }
+      // #region agent log
+      fetch('http://127.0.0.1:7244/ingest/574fd32f-9942-40f1-96d6-0e10426324d4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'debug-session',runId:'pre-fix',hypothesisId:'H1',location:'dashboard/app/(app)/overview/actions.ts:checkUrlTokens:workerError',message:'Worker returned non-OK',data:{status:response.status,endpoint,detailsPreview:details.slice(0,200)},timestamp:Date.now()})}).catch(()=>{});
+      // #endregion agent log
+      return err(`Worker API error: ${response.status} (GET ${endpoint})${details}`);
+    }
+
+    // #region agent log
+    fetch('http://127.0.0.1:7244/ingest/574fd32f-9942-40f1-96d6-0e10426324d4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'debug-session',runId:'pre-fix',hypothesisId:'H1',location:'dashboard/app/(app)/overview/actions.ts:checkUrlTokens:workerOk',message:'Worker returned OK',data:{status:response.status,endpoint},timestamp:Date.now()})}).catch(()=>{});
+    // #endregion agent log
+
+    // Parse internal worker response (JSON) and upsert metrics directly so UI updates
+    // even when the worker cannot call back into a local dashboard URL.
+    const payload = (await response.json().catch(() => null)) as
+      | { ok?: boolean; canonical?: string; htmlTokens?: number | null; mdTokens?: number | null }
+      | null;
+
+    // #region agent log
+    fetch('http://127.0.0.1:7244/ingest/574fd32f-9942-40f1-96d6-0e10426324d4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'debug-session',runId:'post-fix',hypothesisId:'H2',location:'dashboard/app/(app)/overview/actions.ts:checkUrlTokens:parsed',message:'Parsed worker internal JSON',data:{hasPayload:!!payload,ok:payload?.ok===true,hasTokens:(payload?.htmlTokens!==undefined)||(payload?.mdTokens!==undefined),htmlTokens:payload?.htmlTokens??null,mdTokens:payload?.mdTokens??null,canonical:payload?.canonical??null,url},timestamp:Date.now()})}).catch(()=>{});
+    // #endregion agent log
+
+    if (payload?.mdTokens !== undefined) {
+      await prisma.urlMetrics.upsert({
+        where: {
+          customerId_url: {
+            customerId: data.customer.id,
+            url,
+          },
+        },
+        create: {
+          customerId: data.customer.id,
+          url,
+          htmlTokens: payload.htmlTokens ?? null,
+          mdTokens: payload.mdTokens ?? null,
+          optimizedAt: new Date(),
+        },
+        update: {
+          htmlTokens: payload.htmlTokens ?? null,
+          mdTokens: payload.mdTokens ?? null,
+          optimizedAt: new Date(),
+        },
+      });
+
+      // #region agent log
+      fetch('http://127.0.0.1:7244/ingest/574fd32f-9942-40f1-96d6-0e10426324d4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'debug-session',runId:'post-fix',hypothesisId:'H2',location:'dashboard/app/(app)/overview/actions.ts:checkUrlTokens:upsert',message:'Upserted urlMetrics from worker response',data:{customerId:data.customer.id,url},timestamp:Date.now()})}).catch(()=>{});
+      // #endregion agent log
     }
 
     revalidatePath("/overview");
     return ok(undefined);
   } catch (error) {
     console.error("Error checking URL tokens:", error);
+    // #region agent log
+    fetch('http://127.0.0.1:7244/ingest/574fd32f-9942-40f1-96d6-0e10426324d4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'debug-session',runId:'pre-fix',hypothesisId:'H1',location:'dashboard/app/(app)/overview/actions.ts:checkUrlTokens:exception',message:'checkUrlTokens threw',data:{error:String(error)},timestamp:Date.now()})}).catch(()=>{});
+    // #endregion agent log
     return err(error instanceof Error ? error.message : "Failed to check URL");
   }
 }
