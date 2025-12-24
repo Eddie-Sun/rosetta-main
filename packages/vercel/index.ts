@@ -79,6 +79,44 @@ function isAIBot(ua: string | null): boolean {
  *   apiUrl: 'https://rosetta-worker.example.workers.dev'
  * });
  */
+/**
+ * Fetch origin and return with forced 200 status for bots.
+ * Exposes original status via X-Rosetta-Origin-Status header.
+ */
+async function fetchOriginWithForced200(req: NextRequest, timeout: number): Promise<NextResponse> {
+  try {
+    const controller = new AbortController();
+    const id = setTimeout(() => controller.abort(), timeout);
+
+    const res = await fetch(req.url, {
+      headers: req.headers,
+      signal: controller.signal,
+    });
+
+    clearTimeout(id);
+
+    const body = await res.text();
+    return new NextResponse(body, {
+      status: 200,
+      headers: {
+        'Content-Type': res.headers.get('Content-Type') || 'text/html',
+        'X-Rosetta-Status': 'fallback',
+        'X-Rosetta-Origin-Status': String(res.status),
+      },
+    });
+  } catch {
+    // Even on error, return 200 with empty content
+    return new NextResponse('<!-- Rosetta: Origin unavailable -->', {
+      status: 200,
+      headers: {
+        'Content-Type': 'text/html',
+        'X-Rosetta-Status': 'error',
+        'X-Rosetta-Origin-Status': 'unavailable',
+      },
+    });
+  }
+}
+
 export function createMiddleware(config: RosettaConfig): (req: NextRequest) => Promise<NextResponse> {
   const { token, apiUrl = DEFAULT_API_URL, timeout = 5000 } = config;
   const baseUrl = apiUrl.replace(/\/+$/, ''); // Strip trailing slashes
@@ -106,11 +144,13 @@ export function createMiddleware(config: RosettaConfig): (req: NextRequest) => P
 
       if (!res.ok) {
         console.error(`[Rosetta] ${res.status} for ${req.url}`);
-        return NextResponse.next(); // Fallback to origin
+        // Force 200 on bot paths - fetch origin and wrap with 200
+        return fetchOriginWithForced200(req, timeout);
       }
 
       const body = await res.text();
       return new NextResponse(body, {
+        status: 200,
         headers: {
           'Content-Type': res.headers.get('Content-Type') || 'text/markdown',
           'X-Rosetta-Status': res.headers.get('X-Rosetta-Status') || 'unknown',
@@ -118,7 +158,8 @@ export function createMiddleware(config: RosettaConfig): (req: NextRequest) => P
       });
     } catch (err) {
       console.error(`[Rosetta] Error:`, err);
-      return NextResponse.next(); // Never break the site
+      // Force 200 on bot paths - fetch origin and wrap with 200
+      return fetchOriginWithForced200(req, timeout);
     }
   };
 }

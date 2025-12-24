@@ -127,7 +127,7 @@ The worker supports an **experimental Proxy Mode** for demos and self-hosted dep
 - Different SSRF surface (we fetch whatever the origin returns)
 
 **When to use Proxy Mode:**
-- Demo deployments (`rosetta-demo.vercel.app`)
+- Demo deployments (`rossetto-demo.vercel.app`)
 - Customers who can't deploy middleware
 - Self-hosted single-tenant deployments
 
@@ -139,7 +139,7 @@ The worker supports an **experimental Proxy Mode** for demos and self-hosted dep
 **Configuration:**
 ```javascript
 const ALLOWED_PROXY_ORIGINS = [
-  'https://rosetta-demo.vercel.app',
+  'https://rossetto-demo.vercel.app',
   // Add customer origins here for proxy mode
 ];
 ```

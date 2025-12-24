@@ -11,6 +11,7 @@ import {
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { checkUrlTokens } from "./actions";
+import { UrlDetailModal } from "./UrlDetailModal";
 
 type UrlGroup = {
   section: string;
@@ -80,6 +81,40 @@ export function UrlSections({
   const [expanded, setExpanded] = React.useState<Set<string>>(() => new Set());
   const [checkingUrls, setCheckingUrls] = React.useState<Set<string>>(new Set());
   const [error, setError] = React.useState<string | null>(null);
+  const [selectedUrl, setSelectedUrl] = React.useState<string | null>(null);
+
+  const handleRowClick = React.useCallback((url: string) => {
+    setSelectedUrl(url);
+  }, []);
+
+  const handleModalClose = React.useCallback(() => {
+    setSelectedUrl(null);
+  }, []);
+
+  const handleCheckFromModal = React.useCallback(
+    async (url: string) => {
+      setError(null);
+      setCheckingUrls((prev) => new Set(prev).add(url));
+      try {
+        const result = await checkUrlTokens(url);
+        if (!result.ok) {
+          setError(result.error);
+          return;
+        }
+        router.refresh();
+        setTimeout(() => router.refresh(), 1500);
+      } catch {
+        setError("Failed to check URL");
+      } finally {
+        setCheckingUrls((prev) => {
+          const next = new Set(prev);
+          next.delete(url);
+          return next;
+        });
+      }
+    },
+    [router]
+  );
 
   const onCheck = React.useCallback(
     (url: string) =>
@@ -177,21 +212,17 @@ export function UrlSections({
             return (
               <div
                 key={group.section}
-                className="grid grid-cols-[1fr_100px_140px_120px_100px] gap-4 px-4 py-3 hover:bg-[var(--bg-hover)] transition-colors group items-center"
+                className="grid grid-cols-[1fr_100px_140px_120px_100px] gap-4 px-4 py-3 hover:bg-[var(--bg-hover)] transition-colors group items-center cursor-pointer"
+                onClick={() => handleRowClick(url)}
               >
-                <a
-                  href={url}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="flex items-center gap-3 min-w-0 pl-2"
-                >
+                <div className="flex items-center gap-3 min-w-0 pl-2">
                   <FileText className="h-4 w-4 text-muted-foreground flex-shrink-0" />
                   <div className="min-w-0 truncate">
                     <span className="font-mono text-sm text-foreground group-hover:text-accent transition-colors">
                       {path}
                     </span>
                   </div>
-                </a>
+                </div>
                 <div className="flex justify-end">
                   <span className="text-xs text-muted-foreground font-mono">{status}</span>
                 </div>
@@ -280,14 +311,10 @@ export function UrlSections({
                     return (
                       <div
                         key={url}
-                        className="grid grid-cols-[1fr_100px_140px_120px_100px] gap-4 px-4 py-2 hover:bg-[var(--bg-hover)] transition-colors group items-center border-t border-border"
+                        className="grid grid-cols-[1fr_100px_140px_120px_100px] gap-4 px-4 py-2 hover:bg-[var(--bg-hover)] transition-colors group items-center border-t border-border cursor-pointer"
+                        onClick={() => handleRowClick(url)}
                       >
-                        <a
-                          href={url}
-                          target="_blank"
-                          rel="noreferrer"
-                          className="flex items-center gap-3 min-w-0 pl-10"
-                        >
+                        <div className="flex items-center gap-3 min-w-0 pl-10">
                           <FileText className="h-4 w-4 text-muted-foreground flex-shrink-0" />
                           <div className="min-w-0 truncate">
                             <span className="font-mono text-sm text-foreground group-hover:text-accent transition-colors">
@@ -297,7 +324,7 @@ export function UrlSections({
                               {path}
                             </span>
                           </div>
-                        </a>
+                        </div>
                         <div className="flex justify-end">
                           <span className="text-xs text-muted-foreground font-mono">{status}</span>
                         </div>
@@ -333,6 +360,15 @@ export function UrlSections({
           );
         })}
       </div>
+
+      <UrlDetailModal
+        url={selectedUrl}
+        metrics={selectedUrl ? metricsMap?.get(selectedUrl) ?? null : null}
+        isOpen={!!selectedUrl}
+        onClose={handleModalClose}
+        onCheck={handleCheckFromModal}
+        isChecking={selectedUrl ? checkingUrls.has(selectedUrl) : false}
+      />
     </div>
   );
 }

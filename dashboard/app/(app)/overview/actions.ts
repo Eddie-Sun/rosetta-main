@@ -158,7 +158,6 @@ export async function generateStarterList(): Promise<ActionResult> {
     return err("Database error");
   }
 
-  revalidatePath("/overview");
   return ok(undefined);
 }
 
@@ -235,6 +234,73 @@ export async function removeSeedUrl(formData: FormData): Promise<ActionResult> {
     return ok(undefined);
   } catch {
     return err("Database error");
+  }
+}
+
+export type ContentResult = Result<{
+  htmlContent: string | null;
+  mdContent: string | null;
+  htmlTokens: number | null;
+  mdTokens: number | null;
+  htmlCached: boolean;
+  mdCached: boolean;
+}, string>;
+
+export async function fetchUrlContent(url: string): Promise<ContentResult> {
+  const { userId } = await auth();
+  if (!userId) return err("Not authenticated");
+
+  try {
+    const workerApiUrlRaw =
+      process.env.NEXT_PUBLIC_WORKER_API_URL ||
+      process.env.WORKER_API_URL ||
+      "https://api.rosetta.ai";
+    const workerApiUrl = workerApiUrlRaw.replace(/\/+$/, "");
+    const internalKey = process.env.WORKER_INTERNAL_API_KEY;
+
+    if (!internalKey) {
+      return err("WORKER_INTERNAL_API_KEY is not set.");
+    }
+
+    const endpoint = `${workerApiUrl}/render/content?url=${encodeURIComponent(url)}`;
+
+    const response = await fetch(endpoint, {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${internalKey}`,
+      },
+    });
+
+    if (!response.ok) {
+      return err(`Worker API error: ${response.status}`);
+    }
+
+    const payload = await response.json() as {
+      ok?: boolean;
+      htmlContent?: string | null;
+      mdContent?: string | null;
+      htmlTokens?: number | null;
+      mdTokens?: number | null;
+      htmlCached?: boolean;
+      mdCached?: boolean;
+      error?: string;
+    };
+
+    if (!payload.ok) {
+      return err(payload.error || "Failed to fetch content");
+    }
+
+    return ok({
+      htmlContent: payload.htmlContent ?? null,
+      mdContent: payload.mdContent ?? null,
+      htmlTokens: payload.htmlTokens ?? null,
+      mdTokens: payload.mdTokens ?? null,
+      htmlCached: payload.htmlCached ?? false,
+      mdCached: payload.mdCached ?? false,
+    });
+  } catch (error) {
+    console.error("Error fetching URL content:", error);
+    return err(error instanceof Error ? error.message : "Failed to fetch content");
   }
 }
 

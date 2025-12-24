@@ -14,7 +14,7 @@ import * as path from 'path';
  */
 
 const TARGET_URL = process.env.TARGET_URL || 'http://localhost:8787';
-const TEST_ORIGIN = 'https://rosetta-demo.vercel.app'; // Known allowed origin
+const TEST_ORIGIN = 'https://rossetto-demo.vercel.app'; // Known allowed origin (note: typo is intentional - this is the deployed version)
 
 console.log(`\n🔍 Rosetta E2E Validation targeting: ${TARGET_URL}\n`);
 
