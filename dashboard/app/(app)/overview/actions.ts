@@ -89,10 +89,10 @@ export async function generateStarterList(): Promise<ActionResult> {
     const errorMsg = mappedRes.error.code === "missing_api_key"
       ? "Firecrawl API key is missing. Please add FIRECRAWL_API_KEY to your environment variables."
       : mappedRes.error.code === "network_error"
-      ? "Network error. Please check your internet connection."
-      : mappedRes.error.code === "http_error"
-      ? `Firecrawl API error (${mappedRes.error.status}): ${mappedRes.error.statusText}`
-      : `Firecrawl map failed: ${mappedRes.error.code}`;
+        ? "Network error. Please check your internet connection."
+        : mappedRes.error.code === "http_error"
+          ? `Firecrawl API error (${mappedRes.error.status}): ${mappedRes.error.statusText}`
+          : `Firecrawl map failed: ${mappedRes.error.code}`;
     return err(errorMsg);
   }
 
@@ -278,19 +278,10 @@ export async function fetchUrlContent(url: string): Promise<ContentResult> {
         select: { id: true },
       });
       if (customer?.id) {
-        const hasCfCreds = !!process.env.CLOUDFLARE_ACCOUNT_ID && !!process.env.CLOUDFLARE_API_TOKEN;
-        // #region agent log
-        fetch('http://127.0.0.1:7244/ingest/574fd32f-9942-40f1-96d6-0e10426324d4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'debug-session',runId:'post-fix',hypothesisId:'I',location:'dashboard/app/(app)/overview/actions.ts:fetchUrlContent:syncKV:start',message:'best-effort syncCustomerAuthToKV before worker call',data:{hasCfCreds},timestamp:Date.now()})}).catch(()=>{});
-        // #endregion
         await syncCustomerAuthToKV(customer.id);
-        // #region agent log
-        fetch('http://127.0.0.1:7244/ingest/574fd32f-9942-40f1-96d6-0e10426324d4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'debug-session',runId:'post-fix',hypothesisId:'I',location:'dashboard/app/(app)/overview/actions.ts:fetchUrlContent:syncKV:ok',message:'syncCustomerAuthToKV completed',data:{},timestamp:Date.now()})}).catch(()=>{});
-        // #endregion
       }
     } catch (e) {
-      // #region agent log
-      fetch('http://127.0.0.1:7244/ingest/574fd32f-9942-40f1-96d6-0e10426324d4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'debug-session',runId:'post-fix',hypothesisId:'I',location:'dashboard/app/(app)/overview/actions.ts:fetchUrlContent:syncKV:error',message:'syncCustomerAuthToKV failed (best-effort)',data:{err:String((e as any)?.message||e).slice(0,200)},timestamp:Date.now()})}).catch(()=>{});
-      // #endregion
+      // ignore
     }
 
     const workerApiUrlRaw =
@@ -301,18 +292,11 @@ export async function fetchUrlContent(url: string): Promise<ContentResult> {
     const internalKey = process.env.WORKER_INTERNAL_API_KEY;
     const serviceToken = process.env.ROSETTA_SERVICE_TOKEN;
 
-    // #region agent log
-    fetch('http://127.0.0.1:7244/ingest/574fd32f-9942-40f1-96d6-0e10426324d4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'debug-session',runId:'post-fix',hypothesisId:'A',location:'dashboard/app/(app)/overview/actions.ts:fetchUrlContent:env',message:'fetchUrlContent env + base url',data:{workerApiUrlRaw,workerApiUrl,hasInternalKey:!!internalKey,hasServiceToken:!!serviceToken,targetUrlHost:(()=>{try{return new URL(url).host}catch{return null}})(),targetUrlPath:(()=>{try{return new URL(url).pathname}catch{return null}})()},timestamp:Date.now()})}).catch(()=>{});
-    // #endregion
-
     if (!internalKey) {
       return err("WORKER_INTERNAL_API_KEY is not set.");
     }
 
     const endpoint = `${workerApiUrl}/render/content?url=${encodeURIComponent(url)}`;
-    // #region agent log
-    fetch('http://127.0.0.1:7244/ingest/574fd32f-9942-40f1-96d6-0e10426324d4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'debug-session',runId:'pre-fix',hypothesisId:'B',location:'dashboard/app/(app)/overview/actions.ts:fetchUrlContent:endpoint',message:'fetchUrlContent computed endpoint',data:{endpointOrigin:(()=>{try{return new URL(endpoint).origin}catch{return null}})(),endpointPath:(()=>{try{return new URL(endpoint).pathname}catch{return null}})(),workerApiUrl},timestamp:Date.now()})}).catch(()=>{});
-    // #endregion
 
     const response = await fetch(endpoint, {
       method: "GET",
@@ -322,25 +306,10 @@ export async function fetchUrlContent(url: string): Promise<ContentResult> {
     });
 
     if (!response.ok) {
-      // #region agent log
-      fetch('http://127.0.0.1:7244/ingest/574fd32f-9942-40f1-96d6-0e10426324d4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'debug-session',runId:'post-fix',hypothesisId:'C',location:'dashboard/app/(app)/overview/actions.ts:fetchUrlContent:response',message:'fetchUrlContent non-OK response',data:{status:response.status,statusText:response.statusText,endpointPath:(()=>{try{return new URL(endpoint).pathname}catch{return null}})()},timestamp:Date.now()})}).catch(()=>{});
-      // #endregion
-      let errorText = "";
-      try {
-        errorText = await response.text();
-      } catch {
-        // ignore
-      }
-      // #region agent log
-      fetch('http://127.0.0.1:7244/ingest/574fd32f-9942-40f1-96d6-0e10426324d4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'debug-session',runId:'post-fix',hypothesisId:'C',location:'dashboard/app/(app)/overview/actions.ts:fetchUrlContent:responseBody',message:'fetchUrlContent non-OK response body snippet',data:{status:response.status,contentType:response.headers.get('content-type'),server:response.headers.get('server'),cfRay:response.headers.get('cf-ray'),bodySnippet:(errorText||'').slice(0,200)},timestamp:Date.now()})}).catch(()=>{});
-      // #endregion
-
       let diagStatus: number | null = null;
       let diagBodySnippet: string | null = null;
 
       // If we got a 404, probe whether *any* worker route exists at this base URL.
-      // - If /render returns 401 JSON (missing X-Rosetta-Token), we're likely hitting a worker but an older deployment missing /render/content.
-      // - If /render is also HTML 404, WORKER_API_URL points at the wrong service (e.g., a Next.js app / Pages site).
       if (response.status === 404) {
         try {
           const diagUrl = `${workerApiUrl}/render`;
@@ -353,9 +322,6 @@ export async function fetchUrlContent(url: string): Promise<ContentResult> {
           }
           diagStatus = diagRes.status;
           diagBodySnippet = diagText.slice(0, 200);
-          // #region agent log
-          fetch('http://127.0.0.1:7244/ingest/574fd32f-9942-40f1-96d6-0e10426324d4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'debug-session',runId:'post-fix',hypothesisId:'F',location:'dashboard/app/(app)/overview/actions.ts:fetchUrlContent:diagRender',message:'404 diag: probe GET /render without auth',data:{diagUrl,diagStatus:diagRes.status,diagContentType:diagRes.headers.get('content-type'),diagServer:diagRes.headers.get('server'),diagBodySnippet:(diagText||'').slice(0,200)},timestamp:Date.now()})}).catch(()=>{});
-          // #endregion
         } catch {
           // ignore
         }
@@ -366,9 +332,6 @@ export async function fetchUrlContent(url: string): Promise<ContentResult> {
       if (response.status === 404 && serviceToken) {
         try {
           const fallbackEndpoint = `${workerApiUrl}/render?url=${encodeURIComponent(url)}`;
-          // #region agent log
-          fetch('http://127.0.0.1:7244/ingest/574fd32f-9942-40f1-96d6-0e10426324d4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'debug-session',runId:'post-fix',hypothesisId:'G',location:'dashboard/app/(app)/overview/actions.ts:fetchUrlContent:fallbackRender:start',message:'fallback to /render (markdown-only) due to 404 on /render/content',data:{fallbackPath:'/render',workerApiUrl},timestamp:Date.now()})}).catch(()=>{});
-          // #endregion
           const fallbackRes = await fetch(fallbackEndpoint, {
             method: "GET",
             headers: {
@@ -376,9 +339,6 @@ export async function fetchUrlContent(url: string): Promise<ContentResult> {
             },
           });
           const md = await fallbackRes.text().catch(() => "");
-          // #region agent log
-          fetch('http://127.0.0.1:7244/ingest/574fd32f-9942-40f1-96d6-0e10426324d4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'debug-session',runId:'post-fix',hypothesisId:'G',location:'dashboard/app/(app)/overview/actions.ts:fetchUrlContent:fallbackRender:result',message:'fallback /render result',data:{status:fallbackRes.status,statusText:fallbackRes.statusText,contentType:fallbackRes.headers.get('content-type'),server:fallbackRes.headers.get('server'),bodySnippet:(md||'').slice(0,200),mdLen:md.length},timestamp:Date.now()})}).catch(()=>{});
-          // #endregion
 
           if (fallbackRes.ok && md) {
             return ok({
@@ -398,11 +358,7 @@ export async function fetchUrlContent(url: string): Promise<ContentResult> {
       if (response.status === 404) {
         // If the worker is present but /render/content isn't deployed yet, treat this as
         // "preview unavailable" rather than a hard error so the UI can still function.
-        // (The "Check" flow uses /render/internal and can still work.)
         if (diagStatus === 401 && diagBodySnippet?.includes("Missing X-Rosetta-Token")) {
-          // #region agent log
-          fetch('http://127.0.0.1:7244/ingest/574fd32f-9942-40f1-96d6-0e10426324d4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'debug-session',runId:'post-fix',hypothesisId:'J',location:'dashboard/app/(app)/overview/actions.ts:fetchUrlContent:unsupportedPreview',message:'treat /render/content 404 as preview-unavailable (worker present)',data:{},timestamp:Date.now()})}).catch(()=>{});
-          // #endregion
           return ok({
             htmlContent: null,
             mdContent: null,
@@ -448,17 +404,9 @@ export async function checkUrlTokens(url: string): Promise<ActionResult> {
     // Best-effort: keep worker allowlist in sync before triggering internal checks.
     try {
       const hasCfCreds = !!process.env.CLOUDFLARE_ACCOUNT_ID && !!process.env.CLOUDFLARE_API_TOKEN;
-      // #region agent log
-      fetch('http://127.0.0.1:7244/ingest/574fd32f-9942-40f1-96d6-0e10426324d4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'debug-session',runId:'post-fix',hypothesisId:'I',location:'dashboard/app/(app)/overview/actions.ts:checkUrlTokens:syncKV:start',message:'best-effort syncCustomerAuthToKV before internal worker call',data:{hasCfCreds},timestamp:Date.now()})}).catch(()=>{});
-      // #endregion
       await syncCustomerAuthToKV(data.customer.id);
-      // #region agent log
-      fetch('http://127.0.0.1:7244/ingest/574fd32f-9942-40f1-96d6-0e10426324d4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'debug-session',runId:'post-fix',hypothesisId:'I',location:'dashboard/app/(app)/overview/actions.ts:checkUrlTokens:syncKV:ok',message:'syncCustomerAuthToKV completed',data:{},timestamp:Date.now()})}).catch(()=>{});
-      // #endregion
     } catch (e) {
-      // #region agent log
-      fetch('http://127.0.0.1:7244/ingest/574fd32f-9942-40f1-96d6-0e10426324d4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'debug-session',runId:'post-fix',hypothesisId:'I',location:'dashboard/app/(app)/overview/actions.ts:checkUrlTokens:syncKV:error',message:'syncCustomerAuthToKV failed (best-effort)',data:{err:String((e as any)?.message||e).slice(0,200)},timestamp:Date.now()})}).catch(()=>{});
-      // #endregion
+      // ignore sync error
     }
 
     const workerApiUrlRaw =
@@ -468,10 +416,6 @@ export async function checkUrlTokens(url: string): Promise<ActionResult> {
     const workerApiUrl = workerApiUrlRaw.replace(/\/+$/, "");
     const internalKey = process.env.WORKER_INTERNAL_API_KEY;
 
-    // #region agent log
-    fetch('http://127.0.0.1:7244/ingest/574fd32f-9942-40f1-96d6-0e10426324d4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'debug-session',runId:'pre-fix',hypothesisId:'D',location:'dashboard/app/(app)/overview/actions.ts:checkUrlTokens:env',message:'checkUrlTokens env + base url',data:{workerApiUrlRaw,workerApiUrl,hasInternalKey:!!internalKey,customerId:data.customer.id,targetUrlHost:(()=>{try{return new URL(url).host}catch{return null}})(),targetUrlPath:(()=>{try{return new URL(url).pathname}catch{return null}})()},timestamp:Date.now()})}).catch(()=>{});
-    // #endregion
-
     if (!internalKey) {
       return err("WORKER_INTERNAL_API_KEY is not set.");
     }
@@ -479,9 +423,6 @@ export async function checkUrlTokens(url: string): Promise<ActionResult> {
     const endpoint = `${workerApiUrl}/render/internal?customerId=${encodeURIComponent(
       data.customer.id
     )}&url=${encodeURIComponent(url)}`;
-    // #region agent log
-    fetch('http://127.0.0.1:7244/ingest/574fd32f-9942-40f1-96d6-0e10426324d4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'debug-session',runId:'pre-fix',hypothesisId:'E',location:'dashboard/app/(app)/overview/actions.ts:checkUrlTokens:endpoint',message:'checkUrlTokens computed endpoint',data:{endpointOrigin:(()=>{try{return new URL(endpoint).origin}catch{return null}})(),endpointPath:(()=>{try{return new URL(endpoint).pathname}catch{return null}})(),workerApiUrl},timestamp:Date.now()})}).catch(()=>{});
-    // #endregion
 
     const response = await fetch(endpoint, {
       method: "GET",
@@ -495,9 +436,6 @@ export async function checkUrlTokens(url: string): Promise<ActionResult> {
       try {
         const text = await response.text();
         details = text ? `: ${text.slice(0, 300)}` : "";
-        // #region agent log
-        fetch('http://127.0.0.1:7244/ingest/574fd32f-9942-40f1-96d6-0e10426324d4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'debug-session',runId:'pre-fix',hypothesisId:'E',location:'dashboard/app/(app)/overview/actions.ts:checkUrlTokens:response',message:'checkUrlTokens non-OK response (with body snippet)',data:{status:response.status,statusText:response.statusText,endpointPath:(()=>{try{return new URL(endpoint).pathname}catch{return null}})(),bodySnippet:text.slice(0,200)},timestamp:Date.now()})}).catch(()=>{});
-        // #endregion
       } catch {
         // ignore
       }

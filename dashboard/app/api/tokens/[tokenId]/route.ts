@@ -5,8 +5,9 @@ import { revokeApiToken } from "@/lib/tokens";
 
 export async function DELETE(
   _request: NextRequest,
-  { params }: { params: { tokenId: string } }
+  props: { params: Promise<{ tokenId: string }> }
 ) {
+  const params = await props.params;
   try {
     const { userId } = await auth();
     if (!userId) {

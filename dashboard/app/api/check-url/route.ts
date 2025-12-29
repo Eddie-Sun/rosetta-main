@@ -50,7 +50,7 @@ export async function POST(request: NextRequest) {
     // TODO: Implement proper token retrieval/storage mechanism
     // In production, you'd store plaintext tokens securely (encrypted) or use a service account
     const serviceToken = process.env.ROSETTA_SERVICE_TOKEN;
-    
+
     if (!serviceToken) {
       // For development, try to use the token prefix (won't work but allows testing)
       // In production, this should be a proper service token
@@ -59,10 +59,6 @@ export async function POST(request: NextRequest) {
         { status: 500 }
       );
     }
-
-    // #region agent log
-    fetch('http://127.0.0.1:7244/ingest/574fd32f-9942-40f1-96d6-0e10426324d4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'debug-session',runId:'pre-fix',hypothesisId:'B',location:'dashboard/app/api/check-url/route.ts:POST:pre-fetch',message:'check-url route about to call worker',data:{workerApiUrl,endpointPath:(()=>{try{return new URL(`${workerApiUrl}/render`).pathname}catch{return null}})(),targetUrlHost:(()=>{try{return new URL(url).host}catch{return null}})(),targetUrlPath:(()=>{try{return new URL(url).pathname}catch{return null}})()},timestamp:Date.now()})}).catch(()=>{});
-    // #endregion
 
     // Call worker API to trigger optimization
     // This will cause the worker to extract the page, count tokens, and send metrics back
@@ -75,9 +71,6 @@ export async function POST(request: NextRequest) {
 
     if (!response.ok) {
       const errorText = await response.text();
-      // #region agent log
-      fetch('http://127.0.0.1:7244/ingest/574fd32f-9942-40f1-96d6-0e10426324d4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'debug-session',runId:'pre-fix',hypothesisId:'C',location:'dashboard/app/api/check-url/route.ts:POST:worker-response',message:'check-url route worker non-OK response',data:{status:response.status,statusText:response.statusText,bodySnippet:errorText.slice(0,200)},timestamp:Date.now()})}).catch(()=>{});
-      // #endregion
       return NextResponse.json(
         { error: `Worker API error: ${response.status} ${errorText}` },
         { status: response.status }
