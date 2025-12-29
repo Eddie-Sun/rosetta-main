@@ -25,12 +25,20 @@
 // --- CONFIGURATION ---
 const FIRECRAWL_SCRAPE_URL = "https://api.firecrawl.dev/v1/scrape";
 const FIRECRAWL_CRAWL_URL = "https://api.firecrawl.dev/v2/crawl";
-const CACHE_TTL = 86400; // 24 hours for markdown (safer default to avoid stale content)
+const CACHE_TTL = 604800; // 7 days for markdown
 const HTML_CACHE_TTL = 7200; // 2 hours for HTML (shorter - only for debugging)
 const EXTRACT_TIMEOUT_MS = 3000; // 3 seconds (increased from 2s)
 const PENDING_TTL = 30; // Single-flight marker TTL
 const MAX_CRAWL_PAGES = 100;
 const DASHBOARD_API_URL = "https://dashboard.rosetta.ai";
+
+// Response headers
+const ROSETTA_CACHE_STATUS_HEADER = 'X-Rosetta-Cache-Status';
+const ROSETTA_CACHE_STATUS = {
+  HIT: 'HIT',
+  MISS: 'MISS',
+  FAIL: 'FAIL',
+};
 
 // Canonicalization version — increment when changing canonicalize() logic
 // Old cache entries become unreachable and expire naturally (see rules.md 5.1)
@@ -244,175 +252,169 @@ async function handleRenderInternal(request, url, env, ctx) {
   const logger = new Logger(request, ctx);
 
   try {
-    const expected = env.WORKER_INTERNAL_API_KEY;
-    const auth = request.headers.get('Authorization');
-    if (!expected || auth !== `Bearer ${expected}`) {
-      return jsonResponse({ error: 'Unauthorized' }, 401);
-    }
-
-    const customerId = url.searchParams.get('customerId');
-    const targetUrl = url.searchParams.get('url');
-    if (!customerId) return jsonResponse({ error: 'Missing customerId parameter' }, 400);
-    if (!targetUrl) return jsonResponse({ error: 'Missing url parameter' }, 400);
-
-    let parsed;
-    try {
-      parsed = new URL(targetUrl);
-    } catch {
-      return jsonResponse({ error: 'Invalid URL format' }, 400);
-    }
-    if (parsed.protocol !== 'https:') {
-      return jsonResponse({ error: 'URL must use https' }, 400);
-    }
-    if (isPrivateHost(parsed.hostname)) {
-      return jsonResponse({ error: 'Private/internal addresses not allowed' }, 400);
-    }
-
-    let customer;
-    try {
-      customer = await env.ROSETTA_CACHE.get(`customer:${customerId}`, 'json');
-    } catch (err) {
-      logger.error('KV customer config lookup failed', err);
-      return jsonResponse({ error: 'Auth service unavailable' }, 503);
-    }
-
-    if (!customer) {
-      return jsonResponse({ error: 'Customer config not found' }, 404);
-    }
-
-    // Domain allowlist check (match dashboard normalization; strips www for allowlist)
-    const hostname = parsed.hostname.toLowerCase().replace(/^www\./, '');
-    if (!customer.domains || !customer.domains.includes(hostname)) {
-      return jsonResponse({ error: `Domain '${hostname}' not in allowlist` }, 403);
-    }
-
-    // Reuse the same extraction/cache logic as /render, but skip token auth.
-    const canonical = canonicalize(targetUrl);
-    const hash = await sha256(`${CANON_VERSION}:${canonical}`);
-
-    const cacheKey = `md:${hash}`;
-    const tokensKey = `tokens:${hash}`;
-    let cached = null;
-    try {
-      cached = await env.ROSETTA_CACHE.get(cacheKey);
-    } catch (err) {
-      logger.error('KV cache read failed', err);
-    }
-
-    if (cached && !isHTML(cached)) {
-      // Internal endpoint is for dashboard-triggered checks; return structured status
-      // + token counts so the dashboard can update UI deterministically even if
-      // the worker cannot callback into the dashboard environment.
-      let htmlTokens = null;
-      let mdTokens = estimateTokens(cached);
-      try {
-        const cachedTokens = await env.ROSETTA_CACHE.get(tokensKey, 'json');
-        if (cachedTokens && typeof cachedTokens === 'object') {
-          const ht = cachedTokens.htmlTokens;
-          const mt = cachedTokens.mdTokens;
-          if (typeof ht === 'number') htmlTokens = ht;
-          if (typeof mt === 'number') mdTokens = mt;
-        }
-      } catch (err) {
-        logger.error('KV tokens read failed', err);
-      }
-      logger.setCacheStatus('HIT');
-      logger.meta.status = 200;
-      ctx.waitUntil(Promise.resolve(logger.flush()));
-      return jsonResponse({ ok: true, cacheStatus: 'HIT', canonical, htmlTokens, mdTokens }, 200);
-    }
-
-    const pendingKey = `pending:${hash}`;
-    let pending = null;
-    try {
-      pending = await env.ROSETTA_CACHE.get(pendingKey);
-    } catch (err) {
-      logger.error('KV pending read failed', err);
-    }
-
-    if (pending) {
-      for (let i = 0; i < 6; i++) {
-        await sleep(500);
-        try {
-          const md = await env.ROSETTA_CACHE.get(cacheKey);
-          if (md && !isHTML(md)) {
-            logger.setCacheStatus('HIT');
-            logger.meta.status = 200;
-            ctx.waitUntil(Promise.resolve(logger.flush()));
-            return jsonResponse(
-              {
-                ok: true,
-                cacheStatus: 'HIT',
-                canonical,
-                htmlTokens: null,
-                mdTokens: estimateTokens(md)
-              },
-              200
-            );
-          }
-        } catch (err) {
-          logger.error('KV poll read failed', err);
-        }
-      }
-    }
-
-    try {
-      await env.ROSETTA_CACHE.put(pendingKey, Date.now().toString(), { expirationTtl: PENDING_TTL });
-    } catch (err) {
-      logger.error('KV pending write failed', err);
-    }
-
-    try {
-      const scrapeResult = await scrapeWithTimeout(canonical, env.FIRECRAWL_API_KEY, EXTRACT_TIMEOUT_MS);
-      if (scrapeResult && scrapeResult.markdown) {
-        const md = scrapeResult.markdown;
-        const html = scrapeResult.html;
-
-        // Cache content using DRY helper
-        const { htmlTokens, mdTokens } = cacheExtractedContent(env, ctx, hash, md, html, logger);
-        
-        ctx.waitUntil(
-          env.ROSETTA_CACHE.delete(pendingKey)
-            .catch(err => logger.error('KV pending delete failed', err))
-        );
-
-        // Send metrics to dashboard (best-effort)
-        if (htmlTokens !== null) {
-          ctx.waitUntil(
-            sendTokenMetrics(env, customerId, canonical, htmlTokens, mdTokens)
-              .catch(err => logger.error('Token metrics send failed', err))
-          );
-        }
-
-        logger.setCacheStatus('MISS');
-        logger.meta.status = 200;
-        ctx.waitUntil(Promise.resolve(logger.flush()));
-        return jsonResponse(
-          { ok: true, cacheStatus: 'MISS', canonical, htmlTokens, mdTokens },
-          200
-        );
-      }
-    } catch (err) {
-      logger.error('Extract failed', err);
-    }
-
-    ctx.waitUntil(
-      env.ROSETTA_CACHE.delete(pendingKey)
-        .catch(err => logger.error('KV pending delete failed', err))
-    );
-
-    // /render/internal is for dashboard; always return JSON (not HTML fallback)
-    logger.setCacheStatus('FAIL');
-    logger.meta.status = 200;
+    const res = await _handleRenderInternalLogic(request, url, env, ctx, logger);
+    logger.meta.status = res.status;
     ctx.waitUntil(Promise.resolve(logger.flush()));
-    return jsonResponse(
-      { ok: false, cacheStatus: 'FAIL', canonical, htmlTokens: null, mdTokens: null, error: 'Extraction failed' },
-      200
-    );
+    return res;
   } catch (err) {
     logger.error('Unhandled internal API error', err);
-    return jsonResponse({ ok: false, error: 'Internal Server Error', requestId: logger.requestId }, 500);
+    const res = jsonResponse({ ok: false, error: 'Internal Server Error', requestId: logger.requestId }, 500);
+    logger.meta.status = res.status;
+    ctx.waitUntil(Promise.resolve(logger.flush(true)));
+    return res;
   }
+}
+
+async function _handleRenderInternalLogic(request, url, env, ctx, logger) {
+  const expected = env.WORKER_INTERNAL_API_KEY;
+  const auth = request.headers.get('Authorization');
+  if (!expected || auth !== `Bearer ${expected}`) {
+    return jsonResponse({ error: 'Unauthorized' }, 401);
+  }
+
+  const customerId = url.searchParams.get('customerId');
+  const targetUrl = url.searchParams.get('url');
+  if (!customerId) return jsonResponse({ error: 'Missing customerId parameter' }, 400);
+  if (!targetUrl) return jsonResponse({ error: 'Missing url parameter' }, 400);
+
+  let parsed;
+  try {
+    parsed = new URL(targetUrl);
+  } catch {
+    return jsonResponse({ error: 'Invalid URL format' }, 400);
+  }
+  if (parsed.protocol !== 'https:') {
+    return jsonResponse({ error: 'URL must use https' }, 400);
+  }
+  if (isPrivateHost(parsed.hostname)) {
+    return jsonResponse({ error: 'Private/internal addresses not allowed' }, 400);
+  }
+
+  let customer;
+  try {
+    customer = await env.ROSETTA_CACHE.get(`customer:${customerId}`, 'json');
+  } catch (err) {
+    logger.error('KV customer config lookup failed', err);
+    return jsonResponse({ error: 'Auth service unavailable' }, 503);
+  }
+
+  if (!customer) {
+    return jsonResponse({ error: 'Customer config not found' }, 404);
+  }
+
+  const hostname = parsed.hostname.toLowerCase().replace(/^www\./, '');
+  if (!customer.domains || !customer.domains.includes(hostname)) {
+    return jsonResponse({ error: `Domain '${hostname}' not in allowlist` }, 403);
+  }
+
+  const canonical = canonicalize(targetUrl);
+  const hash = await sha256(`${CANON_VERSION}:${canonical}`);
+
+  const cacheKey = `md:${hash}`;
+  const tokensKey = `tokens:${hash}`;
+  let cached = null;
+  try {
+    cached = await env.ROSETTA_CACHE.get(cacheKey);
+  } catch (err) {
+    logger.error('KV cache read failed', err);
+  }
+
+  if (cached && !isHTML(cached)) {
+    let htmlTokens = null;
+    let mdTokens = estimateTokens(cached);
+    try {
+      const cachedTokens = await env.ROSETTA_CACHE.get(tokensKey, 'json');
+      if (cachedTokens && typeof cachedTokens === 'object') {
+        const ht = cachedTokens.htmlTokens;
+        const mt = cachedTokens.mdTokens;
+        if (typeof ht === 'number') htmlTokens = ht;
+        if (typeof mt === 'number') mdTokens = mt;
+      }
+    } catch (err) {
+      logger.error('KV tokens read failed', err);
+    }
+    logger.setCacheStatus('HIT');
+    return jsonResponse({ ok: true, cacheStatus: 'HIT', canonical, htmlTokens, mdTokens }, 200);
+  }
+
+  const pendingKey = `pending:${hash}`;
+  let pending = null;
+  try {
+    pending = await env.ROSETTA_CACHE.get(pendingKey);
+  } catch (err) {
+    logger.error('KV pending read failed', err);
+  }
+
+  if (pending) {
+    for (let i = 0; i < 6; i++) {
+      await sleep(500);
+      try {
+        const md = await env.ROSETTA_CACHE.get(cacheKey);
+        if (md && !isHTML(md)) {
+          logger.setCacheStatus('HIT');
+          return jsonResponse(
+            {
+              ok: true,
+              cacheStatus: 'HIT',
+              canonical,
+              htmlTokens: null,
+              mdTokens: estimateTokens(md)
+            },
+            200
+          );
+        }
+      } catch (err) {
+        logger.error('KV poll read failed', err);
+      }
+    }
+  }
+
+  try {
+    await env.ROSETTA_CACHE.put(pendingKey, Date.now().toString(), { expirationTtl: PENDING_TTL });
+  } catch (err) {
+    logger.error('KV pending write failed', err);
+  }
+
+  try {
+    const scrapeResult = await scrapeWithTimeout(canonical, env.FIRECRAWL_API_KEY, EXTRACT_TIMEOUT_MS);
+    if (scrapeResult && scrapeResult.markdown) {
+      const md = scrapeResult.markdown;
+      const html = scrapeResult.html;
+
+      const { htmlTokens, mdTokens } = cacheExtractedContent(env, ctx, hash, md, html, logger);
+
+      ctx.waitUntil(
+        env.ROSETTA_CACHE.delete(pendingKey)
+          .catch(err => logger.error('KV pending delete failed', err))
+      );
+
+      if (htmlTokens !== null) {
+        ctx.waitUntil(
+          sendTokenMetrics(env, customerId, canonical, htmlTokens, mdTokens)
+            .catch(err => logger.error('Token metrics send failed', err))
+        );
+      }
+
+      logger.setCacheStatus('MISS');
+      return jsonResponse(
+        { ok: true, cacheStatus: 'MISS', canonical, htmlTokens, mdTokens },
+        200
+      );
+    }
+  } catch (err) {
+    logger.error('Extract failed', err);
+  }
+
+  ctx.waitUntil(
+    env.ROSETTA_CACHE.delete(pendingKey)
+      .catch(err => logger.error('KV pending delete failed', err))
+  );
+
+  logger.setCacheStatus('FAIL');
+  return jsonResponse(
+    { ok: false, cacheStatus: 'FAIL', canonical, htmlTokens: null, mdTokens: null, error: 'Extraction failed' },
+    200
+  );
 }
 
 // =============================================================================
@@ -430,74 +432,75 @@ async function handleRenderContent(request, url, env, ctx) {
   const logger = new Logger(request, ctx);
 
   try {
-    // Auth: service-to-service only (dashboard → worker)
-    // Customer-level authorization happens in dashboard before calling this
-    const authHeader = request.headers.get('Authorization');
-    if (!authHeader?.startsWith('Bearer ')) {
-      return jsonResponse({ ok: false, error: 'Missing authorization' }, 401);
-    }
-    const token = authHeader.slice(7);
-    if (token !== env.WORKER_INTERNAL_API_KEY) {
-      return jsonResponse({ ok: false, error: 'Invalid authorization' }, 403);
-    }
-
-    // Get target URL
-    const targetUrl = url.searchParams.get('url');
-    if (!targetUrl) {
-      return jsonResponse({ ok: false, error: 'Missing url parameter' }, 400);
-    }
-
-    // Canonicalize and hash
-    const canonical = canonicalize(targetUrl);
-    const hash = await sha256(`${CANON_VERSION}:${canonical}`);
-    const mdCacheKey = `md:${hash}`;
-    const htmlCacheKey = `html:${hash}`;
-    const tokensKey = `tokens:${hash}`;
-
-    // Try to get cached content (markdown + HTML if available)
-    let mdContent = null;
-    let htmlContent = null;
-    let tokenData = null;
-
-    try {
-      mdContent = await env.ROSETTA_CACHE.get(mdCacheKey);
-    } catch (err) {
-      logger.error('KV MD cache read failed', err);
-    }
-
-    try {
-      // HTML has shorter TTL (2h vs 24h) - may not be available
-      htmlContent = await env.ROSETTA_CACHE.get(htmlCacheKey);
-    } catch (err) {
-      logger.error('KV HTML cache read failed', err);
-    }
-
-    try {
-      tokenData = await env.ROSETTA_CACHE.get(tokensKey, 'json');
-    } catch (err) {
-      logger.error('KV tokens read failed', err);
-    }
-
-    const htmlTokens = tokenData?.htmlTokens ?? null;
-    const mdTokens = tokenData?.mdTokens ?? (mdContent ? estimateTokens(mdContent) : null);
-
+    const res = await _handleRenderContentLogic(request, url, env, ctx, logger);
+    logger.meta.status = res.status;
     ctx.waitUntil(Promise.resolve(logger.flush()));
-
-    return jsonResponse({
-      ok: true,
-      canonical,
-      htmlContent: htmlContent || null,  // May be null if expired (2h TTL)
-      mdContent: mdContent || null,       // Available for 24h
-      htmlTokens,
-      mdTokens,
-      htmlCached: !!htmlContent,
-      mdCached: !!mdContent,
-    }, 200);
-
+    return res;
   } catch (err) {
     logger.error('Unhandled content API error', err);
-    return jsonResponse({ ok: false, error: 'Internal Server Error', requestId: logger.requestId }, 500);
+    const res = jsonResponse({ ok: false, error: 'Internal Server Error', requestId: logger.requestId }, 500);
+    logger.meta.status = res.status;
+    ctx.waitUntil(Promise.resolve(logger.flush(true)));
+    return res;
   }
+}
+
+async function _handleRenderContentLogic(request, url, env, ctx, logger) {
+  const authHeader = request.headers.get('Authorization');
+  if (!authHeader?.startsWith('Bearer ')) {
+    return jsonResponse({ ok: false, error: 'Missing authorization' }, 401);
+  }
+  const token = authHeader.slice(7);
+  if (token !== env.WORKER_INTERNAL_API_KEY) {
+    return jsonResponse({ ok: false, error: 'Invalid authorization' }, 403);
+  }
+
+  const targetUrl = url.searchParams.get('url');
+  if (!targetUrl) {
+    return jsonResponse({ ok: false, error: 'Missing url parameter' }, 400);
+  }
+
+  const canonical = canonicalize(targetUrl);
+  const hash = await sha256(`${CANON_VERSION}:${canonical}`);
+  const mdCacheKey = `md:${hash}`;
+  const htmlCacheKey = `html:${hash}`;
+  const tokensKey = `tokens:${hash}`;
+
+  let mdContent = null;
+  let htmlContent = null;
+  let tokenData = null;
+
+  try {
+    mdContent = await env.ROSETTA_CACHE.get(mdCacheKey);
+  } catch (err) {
+    logger.error('KV MD cache read failed', err);
+  }
+
+  try {
+    htmlContent = await env.ROSETTA_CACHE.get(htmlCacheKey);
+  } catch (err) {
+    logger.error('KV HTML cache read failed', err);
+  }
+
+  try {
+    tokenData = await env.ROSETTA_CACHE.get(tokensKey, 'json');
+  } catch (err) {
+    logger.error('KV tokens read failed', err);
+  }
+
+  const htmlTokens = tokenData?.htmlTokens ?? null;
+  const mdTokens = tokenData?.mdTokens ?? (mdContent ? estimateTokens(mdContent) : null);
+
+  return jsonResponse({
+    ok: true,
+    canonical,
+    htmlContent: htmlContent || null,
+    mdContent: mdContent || null,
+    htmlTokens,
+    mdTokens,
+    htmlCached: !!htmlContent,
+    mdCached: !!mdContent,
+  }, 200);
 }
 
 // =============================================================================
@@ -552,7 +555,6 @@ class Logger {
 
   error(msg, err) {
     this.logs.push({ level: 'error', msg, err: err?.message || String(err), stack: err?.stack });
-    this.flush(true); // Always flush errors
   }
 
   info(msg, data) {
@@ -681,6 +683,7 @@ async function _handleRenderLogic(request, url, env, ctx, logger) {
       headers: {
         'Content-Type': 'text/markdown; charset=utf-8',
         'X-Rosetta-Status': 'hit',
+        [ROSETTA_CACHE_STATUS_HEADER]: ROSETTA_CACHE_STATUS.HIT,
         'Cache-Control': 'public, max-age=3600',
       }
     });
@@ -707,6 +710,7 @@ async function _handleRenderLogic(request, url, env, ctx, logger) {
             headers: {
               'Content-Type': 'text/markdown; charset=utf-8',
               'X-Rosetta-Status': 'hit',
+              [ROSETTA_CACHE_STATUS_HEADER]: ROSETTA_CACHE_STATUS.HIT,
               'Cache-Control': 'public, max-age=3600',
             }
           });
@@ -759,6 +763,7 @@ async function _handleRenderLogic(request, url, env, ctx, logger) {
         headers: {
           'Content-Type': 'text/markdown; charset=utf-8',
           'X-Rosetta-Status': 'miss',
+          [ROSETTA_CACHE_STATUS_HEADER]: ROSETTA_CACHE_STATUS.MISS,
           'Cache-Control': 'public, max-age=3600',
         }
       });
@@ -844,6 +849,7 @@ async function handleProxyMode(request, url, env, ctx) {
         'Content-Type': 'text/markdown; charset=utf-8',
         'Vary': 'User-Agent',
         'X-Rosetta-Status': 'HIT',
+        [ROSETTA_CACHE_STATUS_HEADER]: ROSETTA_CACHE_STATUS.HIT,
         'X-Rosetta-Savings': '98%'
       }
     });
@@ -870,6 +876,7 @@ async function handleProxyMode(request, url, env, ctx) {
               'Content-Type': 'text/markdown; charset=utf-8',
               'Vary': 'User-Agent',
               'X-Rosetta-Status': 'HIT',
+              [ROSETTA_CACHE_STATUS_HEADER]: ROSETTA_CACHE_STATUS.HIT,
               'X-Rosetta-Savings': '98%'
             }
           });
@@ -910,7 +917,8 @@ async function handleProxyMode(request, url, env, ctx) {
       headers: {
         'Content-Type': 'text/markdown; charset=utf-8',
         'Vary': 'User-Agent',
-        'X-Rosetta-Status': 'MISS (Rendered)'
+        'X-Rosetta-Status': 'MISS (Rendered)',
+        [ROSETTA_CACHE_STATUS_HEADER]: ROSETTA_CACHE_STATUS.MISS,
       }
     });
   }
@@ -924,6 +932,7 @@ async function handleProxyMode(request, url, env, ctx) {
     headers: response.headers,
   });
   newResponse.headers.set('X-Rosetta-Status', 'FAIL (Fallback)');
+  newResponse.headers.set(ROSETTA_CACHE_STATUS_HEADER, ROSETTA_CACHE_STATUS.FAIL);
   newResponse.headers.set('X-Rosetta-Origin-Status', String(originStatus));
   newResponse.headers.set('Vary', 'User-Agent');
   return newResponse;
@@ -1263,26 +1272,28 @@ function cacheExtractedContent(env, ctx, hash, md, html, logger = null) {
   const htmlKey = `html:${hash}`;
   const tokensKey = `tokens:${hash}`;
 
-  // Cache markdown (24h) - served to bots
+  const report = (msg, err) => {
+    if (logger) logger.error(msg, err);
+    else console.error(`${msg}:`, err);
+  };
+
   ctx.waitUntil(
     env.ROSETTA_CACHE.put(mdKey, md, { expirationTtl: CACHE_TTL })
-      .catch(err => logger?.error?.('KV MD cache write failed', err) || console.error('KV MD cache write failed:', err))
+      .catch(err => report('KV MD cache write failed', err))
   );
 
-  // Cache HTML (2h) - for dashboard debugging only
   if (html) {
     ctx.waitUntil(
       env.ROSETTA_CACHE.put(htmlKey, html, { expirationTtl: HTML_CACHE_TTL })
-        .catch(err => logger?.error?.('KV HTML cache write failed', err) || console.error('KV HTML cache write failed:', err))
+        .catch(err => report('KV HTML cache write failed', err))
     );
   }
 
-  // Cache token counts for metrics
   const htmlTokens = html ? estimateTokens(html) : null;
   const mdTokens = estimateTokens(md);
   ctx.waitUntil(
     env.ROSETTA_CACHE.put(tokensKey, JSON.stringify({ htmlTokens, mdTokens, ts: Date.now() }), { expirationTtl: CACHE_TTL })
-      .catch(err => logger?.error?.('KV tokens cache write failed', err) || console.error('KV tokens cache write failed:', err))
+      .catch(err => report('KV tokens cache write failed', err))
   );
 
   return { htmlTokens, mdTokens };
@@ -1400,6 +1411,7 @@ async function fetchFallback(url, originalRequest = null) {
       headers: {
         'Content-Type': 'text/html; charset=utf-8',
         'X-Rosetta-Status': 'fallback',
+        [ROSETTA_CACHE_STATUS_HEADER]: ROSETTA_CACHE_STATUS.FAIL,
         'X-Rosetta-Origin-Status': String(res.status),
       }
     });
@@ -1410,6 +1422,7 @@ async function fetchFallback(url, originalRequest = null) {
       headers: {
         'Content-Type': 'text/html; charset=utf-8',
         'X-Rosetta-Status': 'error',
+        [ROSETTA_CACHE_STATUS_HEADER]: ROSETTA_CACHE_STATUS.FAIL,
         'X-Rosetta-Origin-Status': 'unavailable',
       }
     });

@@ -3,6 +3,7 @@
 import * as React from "react";
 import {
   Dialog,
+  DialogClose,
   DialogContent,
   DialogHeader,
   DialogTitle,
@@ -14,6 +15,7 @@ import {
   Loader2,
   FileText,
   Code2,
+  X,
 } from "lucide-react";
 import { fetchUrlContent } from "./actions";
 
@@ -101,6 +103,10 @@ export function UrlDetailModal({
 
     async function loadContent() {
       setContentData(prev => ({ ...prev, isLoading: true, error: null }));
+
+      // #region agent log
+      fetch('http://127.0.0.1:7244/ingest/574fd32f-9942-40f1-96d6-0e10426324d4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'debug-session',runId:'post-fix',hypothesisId:'H',location:'dashboard/app/(app)/overview/UrlDetailModal.tsx:loadContent:start',message:'UrlDetailModal loadContent starting',data:{isOpen,hasUrl:!!url,urlHost:(()=>{try{return url?new URL(url).host:null}catch{return null}})(),urlPath:(()=>{try{return url?new URL(url).pathname:null}catch{return null}})()},timestamp:Date.now()})}).catch(()=>{});
+      // #endregion
       
       const result = await fetchUrlContent(url!);
       
@@ -113,6 +119,9 @@ export function UrlDetailModal({
           isLoading: false,
         });
       } else {
+        // #region agent log
+        fetch('http://127.0.0.1:7244/ingest/574fd32f-9942-40f1-96d6-0e10426324d4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'debug-session',runId:'post-fix',hypothesisId:'H',location:'dashboard/app/(app)/overview/UrlDetailModal.tsx:loadContent:error',message:'UrlDetailModal loadContent got error',data:{error:result.error.slice(0,200)},timestamp:Date.now()})}).catch(()=>{});
+        // #endregion
         setContentData(prev => ({
           ...prev,
           isLoading: false,
@@ -163,23 +172,28 @@ export function UrlDetailModal({
 
   return (
     <Dialog open={isOpen} onOpenChange={(open) => !open && onClose()}>
-      <DialogContent className="sm:max-w-[900px] lg:max-w-[1100px] p-0 gap-0 overflow-hidden bg-background border-border">
+      <DialogContent
+        showCloseButton={false}
+        className="sm:max-w-[920px] lg:max-w-[1120px] p-0 gap-0 overflow-hidden"
+      >
         {/* Header */}
-        <DialogHeader className="px-4 py-3 border-b border-border bg-muted">
+        <DialogHeader className="px-6 py-4 border-b border-[var(--color-theme-border-01-5)]">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-3 min-w-0">
               <FileText className="h-4 w-4 text-accent flex-shrink-0" />
-              <DialogTitle className="text-sm font-medium text-foreground truncate font-mono">
+              <DialogTitle className="text-[13px] font-semibold tracking-tight text-foreground truncate font-mono">
                 {pathname}
               </DialogTitle>
-              <a
-                href={url}
-                target="_blank"
-                rel="noreferrer"
-                className="text-accent hover:text-accent/80 transition-colors flex-shrink-0"
+              <Button
+                asChild
+                variant="ghost"
+                size="icon-sm"
+                className="flex-shrink-0 text-accent hover:text-accent hover:bg-[var(--bg-hover)]"
               >
-                <ExternalLink className="h-3.5 w-3.5" />
-              </a>
+                <a href={url} target="_blank" rel="noreferrer" aria-label="Open URL in new tab">
+                  <ExternalLink className="h-4 w-4" />
+                </a>
+              </Button>
             </div>
             <div className="flex items-center gap-3">
               {optimizedDate && (
@@ -188,36 +202,46 @@ export function UrlDetailModal({
                 </span>
               )}
               {savingsPercent !== null && savingsPercent > 0 && (
-                <span className="text-xs px-2 py-1 border border-border bg-background text-accent font-mono tabular-nums">
+                <span className="text-xs px-2 py-1 border border-border/70 bg-background/40 text-accent font-mono tabular-nums">
                   {savingsPercent}% savings
                 </span>
               )}
+              <DialogClose asChild>
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  className="text-muted-foreground hover:text-foreground hover:bg-[var(--bg-hover)]"
+                  aria-label="Close"
+                >
+                  <X className="h-4 w-4" />
+                </Button>
+              </DialogClose>
             </div>
           </div>
         </DialogHeader>
 
         {/* Content Comparison */}
-        <div className="bg-background">
+        <div className="bg-transparent">
           {/* Side by Side Content */}
-          <div className="grid lg:grid-cols-2 divide-y lg:divide-y-0 lg:divide-x divide-border">
+          <div className="grid lg:grid-cols-2 divide-y lg:divide-y-0 lg:divide-x divide-[var(--color-theme-border-01-5)]">
             {/* HTML Panel */}
             <div className="flex flex-col">
-              <div className="px-4 py-2 border-b border-border bg-muted flex items-center justify-between">
+              <div className="px-6 py-3 border-b border-[var(--color-theme-border-01-5)] flex items-center justify-between">
                 <div className="flex items-center gap-2">
                   <Code2 className="h-3.5 w-3.5 text-muted-foreground" />
-                  <span className="text-sm font-medium text-foreground">HTML</span>
-                  <span className="text-xs px-1.5 py-0.5 border border-border bg-background text-muted-foreground font-mono">
+                  <span className="text-[13px] font-medium text-foreground">HTML</span>
+                  <span className="text-[11px] px-1.5 py-0.5 border border-border/70 bg-background/30 text-muted-foreground font-mono">
                     HUMAN
                   </span>
                 </div>
               </div>
-              <div className="px-4 py-2 border-b border-border bg-[var(--color-theme-card-hex)] flex items-center gap-4 text-xs text-muted-foreground font-mono tabular-nums">
+              <div className="px-6 py-2 border-b border-[var(--color-theme-border-01-5)] flex items-center gap-4 text-xs text-muted-foreground font-mono tabular-nums">
                 <span>{htmlTokens.toLocaleString()} tokens</span>
                 <span>•</span>
                 <span>{estimateBytesFromTokens(htmlTokens)}</span>
               </div>
-              <div className="flex-1 p-4 bg-[var(--color-theme-card-hex)]">
-                <pre className="text-xs overflow-auto h-[350px] bg-muted p-4 border border-border font-mono whitespace-pre-wrap break-words">
+              <div className="flex-1 p-4">
+                <pre className="text-xs overflow-auto h-[350px] bg-background/40 p-4 border border-border/60 font-mono whitespace-pre-wrap break-words">
                   <code className="text-muted-foreground">
                     {contentData.isLoading ? (
                       <span className="text-muted-foreground/60 italic flex items-center gap-2">
@@ -253,22 +277,22 @@ export function UrlDetailModal({
 
             {/* Markdown Panel */}
             <div className="flex flex-col">
-              <div className="px-4 py-2 border-b border-border bg-muted flex items-center justify-between">
+              <div className="px-6 py-3 border-b border-[var(--color-theme-border-01-5)] flex items-center justify-between">
                 <div className="flex items-center gap-2">
                   <FileText className="h-3.5 w-3.5 text-accent" />
-                  <span className="text-sm font-medium text-foreground">Markdown</span>
-                  <span className="text-xs px-1.5 py-0.5 border border-border bg-background text-muted-foreground font-mono">
+                  <span className="text-[13px] font-medium text-foreground">Markdown</span>
+                  <span className="text-[11px] px-1.5 py-0.5 border border-border/70 bg-background/30 text-muted-foreground font-mono">
                     BOT
                   </span>
                 </div>
               </div>
-              <div className="px-4 py-2 border-b border-border bg-[var(--color-theme-card-hex)] flex items-center gap-4 text-xs text-muted-foreground font-mono tabular-nums">
+              <div className="px-6 py-2 border-b border-[var(--color-theme-border-01-5)] flex items-center gap-4 text-xs text-muted-foreground font-mono tabular-nums">
                 <span>{mdTokens.toLocaleString()} tokens</span>
                 <span>•</span>
                 <span>{estimateBytesFromTokens(mdTokens)}</span>
               </div>
-              <div className="flex-1 p-4 bg-[var(--color-theme-card-hex)]">
-                <pre className="text-xs overflow-auto h-[350px] bg-muted p-4 border border-border font-mono whitespace-pre-wrap break-words">
+              <div className="flex-1 p-4">
+                <pre className="text-xs overflow-auto h-[350px] bg-background/40 p-4 border border-border/60 font-mono whitespace-pre-wrap break-words">
                   <code className="text-foreground">
                     {contentData.isLoading ? (
                       <span className="text-muted-foreground/60 italic flex items-center gap-2">
@@ -303,7 +327,7 @@ export function UrlDetailModal({
         </div>
 
         {/* Footer */}
-        <div className="px-4 py-3 border-t border-border bg-muted flex items-center justify-between">
+        <div className="px-6 py-4 border-t border-[var(--color-theme-border-01-5)] flex items-center justify-between">
           <div className="text-xs text-muted-foreground font-mono truncate max-w-[50%]">
             {url}
           </div>
@@ -318,7 +342,8 @@ export function UrlDetailModal({
             <Button
               onClick={handleCheck}
               disabled={isChecking}
-              className="h-8 px-3 text-xs bg-accent text-accent-foreground hover:bg-accent/90"
+              variant="outline"
+              className="h-8 px-3 text-xs border-accent/25 bg-background/30 text-accent hover:bg-accent/10 hover:text-accent"
             >
               {isChecking ? (
                 <>
