@@ -719,9 +719,14 @@ async function _handleRenderLogic(request, url, env, ctx, logger) {
         logger.error('KV poll read failed', err);
       }
     }
-    // Timed out waiting, return fallback
-    logger.setCacheStatus('MISS');
-    return await fetchFallback(canonical, request);
+    // Timed out waiting, return JSON error (API contract)
+    logger.setCacheStatus('FAIL');
+    logger.error('Timed out waiting for pending extraction', new Error('Pending extraction timeout'));
+    logger.info('Pending extraction timeout context', { canonical, hash, cacheKey, pendingKey });
+    const res = jsonResponse({ error: 'Timed out waiting for extraction' }, 503);
+    res.headers.set('X-Rosetta-Status', 'timeout');
+    res.headers.set(ROSETTA_CACHE_STATUS_HEADER, ROSETTA_CACHE_STATUS.FAIL);
+    return res;
   }
 
   // 6. EXTRACT (with single-flight marker)
@@ -778,7 +783,14 @@ async function _handleRenderLogic(request, url, env, ctx, logger) {
       .catch(err => logger.error('KV pending delete failed', err))
   );
 
-  return await fetchFallback(canonical, request);
+  // Extraction failed, return JSON error (API contract)
+  logger.setCacheStatus('FAIL');
+  logger.error('Extraction failed - returning API error', new Error('Extraction failed'));
+  logger.info('Extraction failure context', { canonical, hash, cacheKey, pendingKey });
+  const res = jsonResponse({ error: 'Extraction failed' }, 500);
+  res.headers.set('X-Rosetta-Status', 'fail');
+  res.headers.set(ROSETTA_CACHE_STATUS_HEADER, ROSETTA_CACHE_STATUS.FAIL);
+  return res;
 }
 
 // =============================================================================
