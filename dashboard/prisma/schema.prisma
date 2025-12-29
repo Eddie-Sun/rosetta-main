@@ -1,5 +1,8 @@
 generator client {
   provider = "prisma-client-js"
+  // Prisma v7 can generate the "client" engine which requires a driver adapter
+  // or Accelerate. This dashboard uses the classic engine, so force it.
+  engineType = "binary"
 }
 
 datasource db {
@@ -23,6 +26,11 @@ enum PublishJobKind {
   auth_kv_sync
 }
 
+enum SeedUrlSource {
+  firecrawl_map
+  manual
+}
+
 model Customer {
   id          String   @id
   clerkUserId String   @unique
@@ -34,6 +42,9 @@ model Customer {
   domains     Domain[]
   apiTokens   ApiToken[]
   publishJobs PublishJob[]
+  seedUrls    SeedUrl[]
+  mapSnapshots MapSnapshot[]
+  urlMetrics  UrlMetrics[]
 }
 
 model Domain {
@@ -45,9 +56,40 @@ model Domain {
   updatedAt  DateTime @updatedAt
 
   customer   Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  mapSnapshots MapSnapshot[]
 
   @@unique([customerId, hostname])
   @@index([hostname])
+}
+
+model SeedUrl {
+  id         String        @id
+  customerId String
+  url        String
+  source     SeedUrlSource
+  enabled    Boolean       @default(true)
+  createdAt  DateTime      @default(now())
+  updatedAt  DateTime      @updatedAt
+
+  customer   Customer      @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  @@unique([customerId, url])
+  @@index([customerId, enabled])
+}
+
+model MapSnapshot {
+  id         String   @id
+  customerId String
+  domainId   String
+  urls       Json
+  fetchedAt  DateTime
+  createdAt  DateTime @default(now())
+
+  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  domain     Domain   @relation(fields: [domainId], references: [id], onDelete: Cascade)
+
+  @@unique([customerId, domainId])
+  @@index([customerId, fetchedAt])
 }
 
 model ApiToken {
@@ -55,6 +97,7 @@ model ApiToken {
   customerId  String
   tokenHash   String    @unique
   tokenPrefix String
+  label       String?
   revokedAt   DateTime?
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
@@ -79,6 +122,23 @@ model PublishJob {
 
   @@index([state, createdAt])
   @@index([customerId])
+}
+
+model UrlMetrics {
+  id          String   @id @default(uuid())
+  customerId  String
+  url         String
+  htmlTokens  Int?
+  mdTokens    Int?
+  optimizedAt DateTime
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  customer    Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  @@unique([customerId, url])
+  @@index([customerId, optimizedAt])
+  @@index([customerId, url])
 }
 
 

@@ -25,10 +25,24 @@
 // --- CONFIGURATION ---
 const FIRECRAWL_SCRAPE_URL = "https://api.firecrawl.dev/v1/scrape";
 const FIRECRAWL_CRAWL_URL = "https://api.firecrawl.dev/v2/crawl";
-const CACHE_TTL = 86400; // 24 hours (safer default to avoid stale content)
+const CACHE_TTL = 604800; // 7 days for markdown
+const HTML_CACHE_TTL = 7200; // 2 hours for HTML (shorter - only for debugging)
 const EXTRACT_TIMEOUT_MS = 3000; // 3 seconds (increased from 2s)
 const PENDING_TTL = 30; // Single-flight marker TTL
 const MAX_CRAWL_PAGES = 100;
+const DASHBOARD_API_URL = "https://dashboard.rosetta.ai";
+
+// Response headers
+const ROSETTA_CACHE_STATUS_HEADER = 'X-Rosetta-Cache-Status';
+const ROSETTA_CACHE_STATUS = {
+  HIT: 'HIT',
+  MISS: 'MISS',
+  FAIL: 'FAIL',
+};
+
+// Canonicalization version — increment when changing canonicalize() logic
+// Old cache entries become unreachable and expire naturally (see rules.md 5.1)
+const CANON_VERSION = 'v1';
 
 // SSRF protection: block private/internal IP ranges
 const PRIVATE_IP_PATTERNS = [
@@ -46,6 +60,7 @@ const PRIVATE_IP_PATTERNS = [
 // Headers that should NOT be forwarded to origin (security)
 const STRIP_HEADERS = [
   'x-rosetta-token',
+  'authorization',       // Never leak auth credentials to origin
   'cf-connecting-ip',
   'cf-ray',
   'cf-ipcountry',
@@ -66,7 +81,6 @@ const SAFE_FORWARD_HEADERS = [
 // Allowed origins for proxy mode (add your domains here)
 const ALLOWED_PROXY_ORIGINS = [
   'https://rossetto-demo.vercel.app',
-  'https://rosetta-demo.vercel.app',
 ];
 
 // =============================================================================
@@ -202,6 +216,17 @@ export default {
       return handleRenderAPI(request, url, env, ctx);
     }
 
+    // --- INTERNAL API MODE: GET /render/internal?customerId=...&url=... (service-auth) ---
+    if (url.pathname === '/render/internal') {
+      return handleRenderInternal(request, url, env, ctx);
+    }
+
+    // --- CONTENT API: GET /render/content?url=... (service-auth) ---
+    // Returns cached markdown content for display in dashboard
+    if (url.pathname === '/render/content') {
+      return handleRenderContent(request, url, env, ctx);
+    }
+
     // --- CRAWL API ROUTES (with auth) ---
     if (url.pathname === '/_rosetta/crawl' && request.method === 'POST') {
       return handleCrawlStart(request, env, ctx);
@@ -216,6 +241,267 @@ export default {
     return handleProxyMode(request, url, env, ctx);
   }
 };
+
+// =============================================================================
+// INTERNAL API MODE HANDLER - GET /render/internal?customerId=...&url=...
+// Uses customer:<id> config in KV so the dashboard can trigger checks without
+// storing plaintext customer tokens server-side.
+// =============================================================================
+
+async function handleRenderInternal(request, url, env, ctx) {
+  const logger = new Logger(request, ctx);
+
+  try {
+    const res = await _handleRenderInternalLogic(request, url, env, ctx, logger);
+    logger.meta.status = res.status;
+    ctx.waitUntil(Promise.resolve(logger.flush()));
+    return res;
+  } catch (err) {
+    logger.error('Unhandled internal API error', err);
+    const res = jsonResponse({ ok: false, error: 'Internal Server Error', requestId: logger.requestId }, 500);
+    logger.meta.status = res.status;
+    ctx.waitUntil(Promise.resolve(logger.flush(true)));
+    return res;
+  }
+}
+
+async function _handleRenderInternalLogic(request, url, env, ctx, logger) {
+  const expected = env.WORKER_INTERNAL_API_KEY;
+  const auth = request.headers.get('Authorization');
+  if (!expected || auth !== `Bearer ${expected}`) {
+    return jsonResponse({ error: 'Unauthorized' }, 401);
+  }
+
+  const customerId = url.searchParams.get('customerId');
+  const targetUrl = url.searchParams.get('url');
+  if (!customerId) return jsonResponse({ error: 'Missing customerId parameter' }, 400);
+  if (!targetUrl) return jsonResponse({ error: 'Missing url parameter' }, 400);
+
+  let parsed;
+  try {
+    parsed = new URL(targetUrl);
+  } catch {
+    return jsonResponse({ error: 'Invalid URL format' }, 400);
+  }
+  if (parsed.protocol !== 'https:') {
+    return jsonResponse({ error: 'URL must use https' }, 400);
+  }
+  if (isPrivateHost(parsed.hostname)) {
+    return jsonResponse({ error: 'Private/internal addresses not allowed' }, 400);
+  }
+
+  let customer;
+  try {
+    customer = await env.ROSETTA_CACHE.get(`customer:${customerId}`, 'json');
+  } catch (err) {
+    logger.error('KV customer config lookup failed', err);
+    return jsonResponse({ error: 'Auth service unavailable' }, 503);
+  }
+
+  if (!customer) {
+    return jsonResponse({ error: 'Customer config not found' }, 404);
+  }
+
+  const hostname = parsed.hostname.toLowerCase().replace(/^www\./, '');
+  if (!customer.domains || !customer.domains.includes(hostname)) {
+    return jsonResponse({ error: `Domain '${hostname}' not in allowlist` }, 403);
+  }
+
+  const canonical = canonicalize(targetUrl);
+  const hash = await sha256(`${CANON_VERSION}:${canonical}`);
+
+  const cacheKey = `md:${hash}`;
+  const tokensKey = `tokens:${hash}`;
+  let cached = null;
+  try {
+    cached = await env.ROSETTA_CACHE.get(cacheKey);
+  } catch (err) {
+    logger.error('KV cache read failed', err);
+  }
+
+  if (cached && !isHTML(cached)) {
+    let htmlTokens = null;
+    let mdTokens = estimateTokens(cached);
+    try {
+      const cachedTokens = await env.ROSETTA_CACHE.get(tokensKey, 'json');
+      if (cachedTokens && typeof cachedTokens === 'object') {
+        const ht = cachedTokens.htmlTokens;
+        const mt = cachedTokens.mdTokens;
+        if (typeof ht === 'number') htmlTokens = ht;
+        if (typeof mt === 'number') mdTokens = mt;
+      }
+    } catch (err) {
+      logger.error('KV tokens read failed', err);
+    }
+    logger.setCacheStatus('HIT');
+    return jsonResponse({ ok: true, cacheStatus: 'HIT', canonical, htmlTokens, mdTokens }, 200);
+  }
+
+  const pendingKey = `pending:${hash}`;
+  let pending = null;
+  try {
+    pending = await env.ROSETTA_CACHE.get(pendingKey);
+  } catch (err) {
+    logger.error('KV pending read failed', err);
+  }
+
+  if (pending) {
+    for (let i = 0; i < 6; i++) {
+      await sleep(500);
+      try {
+        const md = await env.ROSETTA_CACHE.get(cacheKey);
+        if (md && !isHTML(md)) {
+          logger.setCacheStatus('HIT');
+          return jsonResponse(
+            {
+              ok: true,
+              cacheStatus: 'HIT',
+              canonical,
+              htmlTokens: null,
+              mdTokens: estimateTokens(md)
+            },
+            200
+          );
+        }
+      } catch (err) {
+        logger.error('KV poll read failed', err);
+      }
+    }
+  }
+
+  try {
+    await env.ROSETTA_CACHE.put(pendingKey, Date.now().toString(), { expirationTtl: PENDING_TTL });
+  } catch (err) {
+    logger.error('KV pending write failed', err);
+  }
+
+  try {
+    const scrapeResult = await scrapeWithTimeout(canonical, env.FIRECRAWL_API_KEY, EXTRACT_TIMEOUT_MS);
+    if (scrapeResult && scrapeResult.markdown) {
+      const md = scrapeResult.markdown;
+      const html = scrapeResult.html;
+
+      const { htmlTokens, mdTokens } = cacheExtractedContent(env, ctx, hash, md, html, logger);
+
+      ctx.waitUntil(
+        env.ROSETTA_CACHE.delete(pendingKey)
+          .catch(err => logger.error('KV pending delete failed', err))
+      );
+
+      if (htmlTokens !== null) {
+        ctx.waitUntil(
+          sendTokenMetrics(env, customerId, canonical, htmlTokens, mdTokens)
+            .catch(err => logger.error('Token metrics send failed', err))
+        );
+      }
+
+      logger.setCacheStatus('MISS');
+      return jsonResponse(
+        { ok: true, cacheStatus: 'MISS', canonical, htmlTokens, mdTokens },
+        200
+      );
+    }
+  } catch (err) {
+    logger.error('Extract failed', err);
+  }
+
+  ctx.waitUntil(
+    env.ROSETTA_CACHE.delete(pendingKey)
+      .catch(err => logger.error('KV pending delete failed', err))
+  );
+
+  logger.setCacheStatus('FAIL');
+  return jsonResponse(
+    { ok: false, cacheStatus: 'FAIL', canonical, htmlTokens: null, mdTokens: null, error: 'Extraction failed' },
+    200
+  );
+}
+
+// =============================================================================
+// CONTENT API HANDLER - GET /render/content?url=...
+// Returns cached markdown + HTML content for dashboard display
+//
+// SECURITY MODEL (service-to-service):
+// - Authenticated via WORKER_INTERNAL_API_KEY (shared secret with dashboard)
+// - Dashboard is responsible for customer authorization
+// - Cached content was validated at extraction time (domain allowlist)
+// - This is a read-only cache lookup, not a data access control boundary
+// =============================================================================
+
+async function handleRenderContent(request, url, env, ctx) {
+  const logger = new Logger(request, ctx);
+
+  try {
+    const res = await _handleRenderContentLogic(request, url, env, ctx, logger);
+    logger.meta.status = res.status;
+    ctx.waitUntil(Promise.resolve(logger.flush()));
+    return res;
+  } catch (err) {
+    logger.error('Unhandled content API error', err);
+    const res = jsonResponse({ ok: false, error: 'Internal Server Error', requestId: logger.requestId }, 500);
+    logger.meta.status = res.status;
+    ctx.waitUntil(Promise.resolve(logger.flush(true)));
+    return res;
+  }
+}
+
+async function _handleRenderContentLogic(request, url, env, ctx, logger) {
+  const authHeader = request.headers.get('Authorization');
+  if (!authHeader?.startsWith('Bearer ')) {
+    return jsonResponse({ ok: false, error: 'Missing authorization' }, 401);
+  }
+  const token = authHeader.slice(7);
+  if (token !== env.WORKER_INTERNAL_API_KEY) {
+    return jsonResponse({ ok: false, error: 'Invalid authorization' }, 403);
+  }
+
+  const targetUrl = url.searchParams.get('url');
+  if (!targetUrl) {
+    return jsonResponse({ ok: false, error: 'Missing url parameter' }, 400);
+  }
+
+  const canonical = canonicalize(targetUrl);
+  const hash = await sha256(`${CANON_VERSION}:${canonical}`);
+  const mdCacheKey = `md:${hash}`;
+  const htmlCacheKey = `html:${hash}`;
+  const tokensKey = `tokens:${hash}`;
+
+  let mdContent = null;
+  let htmlContent = null;
+  let tokenData = null;
+
+  try {
+    mdContent = await env.ROSETTA_CACHE.get(mdCacheKey);
+  } catch (err) {
+    logger.error('KV MD cache read failed', err);
+  }
+
+  try {
+    htmlContent = await env.ROSETTA_CACHE.get(htmlCacheKey);
+  } catch (err) {
+    logger.error('KV HTML cache read failed', err);
+  }
+
+  try {
+    tokenData = await env.ROSETTA_CACHE.get(tokensKey, 'json');
+  } catch (err) {
+    logger.error('KV tokens read failed', err);
+  }
+
+  const htmlTokens = tokenData?.htmlTokens ?? null;
+  const mdTokens = tokenData?.mdTokens ?? (mdContent ? estimateTokens(mdContent) : null);
+
+  return jsonResponse({
+    ok: true,
+    canonical,
+    htmlContent: htmlContent || null,
+    mdContent: mdContent || null,
+    htmlTokens,
+    mdTokens,
+    htmlCached: !!htmlContent,
+    mdCached: !!mdContent,
+  }, 200);
+}
 
 // =============================================================================
 // OBSERVABILITY & LOGGING
@@ -269,7 +555,6 @@ class Logger {
 
   error(msg, err) {
     this.logs.push({ level: 'error', msg, err: err?.message || String(err), stack: err?.stack });
-    this.flush(true); // Always flush errors
   }
 
   info(msg, data) {
@@ -329,7 +614,12 @@ async function _handleRenderLogic(request, url, env, ctx, logger) {
 
   let customer;
   try {
-    customer = await env.ROSETTA_CACHE.get(`apikey:${token}`, 'json');
+    const tokenHash = await sha256(token);
+    customer = await env.ROSETTA_CACHE.get(`apikeyhash:${tokenHash}`, 'json');
+
+    if (!customer) {
+      customer = await env.ROSETTA_CACHE.get(`apikey:${token}`, 'json');
+    }
   } catch (err) {
     logger.error('KV auth lookup failed', err);
     return jsonResponse({ error: 'Auth service unavailable' }, 503);
@@ -339,7 +629,11 @@ async function _handleRenderLogic(request, url, env, ctx, logger) {
     return jsonResponse({ error: 'Invalid API token' }, 401);
   }
 
-  logger.setTenant(customer.id);
+  const customerId = customer.id || customer.customerId;
+  if (!customerId) {
+    return jsonResponse({ error: 'Invalid customer config format' }, 500);
+  }
+  logger.setTenant(customerId);
 
   // 2. VALIDATE URL
   const targetUrl = url.searchParams.get('url');
@@ -371,7 +665,7 @@ async function _handleRenderLogic(request, url, env, ctx, logger) {
 
   // 3. CANONICALIZE
   const canonical = canonicalize(targetUrl);
-  const hash = await sha256(canonical);
+  const hash = await sha256(`${CANON_VERSION}:${canonical}`);
 
   // 4. CACHE CHECK (with error handling)
   const cacheKey = `md:${hash}`;
@@ -389,8 +683,8 @@ async function _handleRenderLogic(request, url, env, ctx, logger) {
       headers: {
         'Content-Type': 'text/markdown; charset=utf-8',
         'X-Rosetta-Status': 'hit',
+        [ROSETTA_CACHE_STATUS_HEADER]: ROSETTA_CACHE_STATUS.HIT,
         'Cache-Control': 'public, max-age=3600',
-        'Access-Control-Allow-Origin': '*'
       }
     });
   }
@@ -416,8 +710,8 @@ async function _handleRenderLogic(request, url, env, ctx, logger) {
             headers: {
               'Content-Type': 'text/markdown; charset=utf-8',
               'X-Rosetta-Status': 'hit',
+              [ROSETTA_CACHE_STATUS_HEADER]: ROSETTA_CACHE_STATUS.HIT,
               'Cache-Control': 'public, max-age=3600',
-              'Access-Control-Allow-Origin': '*'
             }
           });
         }
@@ -438,14 +732,14 @@ async function _handleRenderLogic(request, url, env, ctx, logger) {
   }
 
   try {
-    const md = await scrapeWithTimeout(canonical, env.FIRECRAWL_API_KEY, EXTRACT_TIMEOUT_MS);
+    const scrapeResult = await scrapeWithTimeout(canonical, env.FIRECRAWL_API_KEY, EXTRACT_TIMEOUT_MS);
 
-    if (md) {
-      // Cache the result (fire and forget)
-      ctx.waitUntil(
-        env.ROSETTA_CACHE.put(cacheKey, md, { expirationTtl: CACHE_TTL })
-          .catch(err => logger.error('KV cache write failed', err))
-      );
+    if (scrapeResult && scrapeResult.markdown) {
+      const md = scrapeResult.markdown;
+      const html = scrapeResult.html;
+
+      // Cache content using DRY helper
+      const { htmlTokens, mdTokens } = cacheExtractedContent(env, ctx, hash, md, html, logger);
 
       // Clean up pending marker
       ctx.waitUntil(
@@ -454,15 +748,23 @@ async function _handleRenderLogic(request, url, env, ctx, logger) {
       );
 
       // Track usage (fire and forget)
-      ctx.waitUntil(incrementUsage(env, customer.id));
+      ctx.waitUntil(incrementUsage(env, customerId));
+
+      // Send metrics to dashboard (best-effort)
+      if (htmlTokens !== null) {
+        ctx.waitUntil(
+          sendTokenMetrics(env, customerId, canonical, htmlTokens, mdTokens)
+            .catch(err => logger.error('Token metrics send failed', err))
+        );
+      }
 
       logger.setCacheStatus('MISS');
       return new Response(md, {
         headers: {
           'Content-Type': 'text/markdown; charset=utf-8',
           'X-Rosetta-Status': 'miss',
+          [ROSETTA_CACHE_STATUS_HEADER]: ROSETTA_CACHE_STATUS.MISS,
           'Cache-Control': 'public, max-age=3600',
-          'Access-Control-Allow-Origin': '*'
         }
       });
     }
@@ -510,7 +812,7 @@ async function handleProxyMode(request, url, env, ctx) {
   // Construct target URL
   const targetUrl = new URL(targetOrigin + url.pathname);
   url.searchParams.forEach((value, key) => {
-    if (key !== 'target' && key !== 'demo') {
+    if (key !== 'target') {
       targetUrl.searchParams.append(key, value);
     }
   });
@@ -519,31 +821,24 @@ async function handleProxyMode(request, url, env, ctx) {
   const isBot = isAIBot(userAgent); // Only AI bots, not social/SEO/search
   const isAsset = IGNORE_EXT.some(ext => url.pathname.toLowerCase().endsWith(ext));
   const isBlacklisted = BLACKLIST.some(pattern => new RegExp(pattern).test(url.pathname));
-  const isDemo = url.searchParams.get('demo') === 'true';
 
   // Human/asset/blacklisted/non-AI-bot: pass through to origin
   // Social bots (Twitter, Slack) get HTML with OG tags
   // SEO bots (Ahrefs) get real HTML
   // Only AI bots get markdown
-  if ((!isBot && !isDemo) || isAsset || isBlacklisted) {
+  if (!isBot || isAsset || isBlacklisted) {
     return proxyToOrigin(targetUrl, request);
   }
 
   // Bot path: check cache then scrape
   const canonical = canonicalize(targetUrl.toString());
-  const hash = await sha256(canonical);
+  const hash = await sha256(`${CANON_VERSION}:${canonical}`);
   const cacheKey = `md:${hash}`;
-
-  // Also check legacy key format for backwards compatibility
-  const legacyCacheKey = `md::${targetUrl.toString()}`;
 
   // Cache lookup with error handling
   let cachedMD = null;
   try {
     cachedMD = await env.ROSETTA_CACHE.get(cacheKey);
-    if (!cachedMD) {
-      cachedMD = await env.ROSETTA_CACHE.get(legacyCacheKey);
-    }
   } catch (err) {
     console.error('KV cache read failed:', err);
   }
@@ -554,6 +849,7 @@ async function handleProxyMode(request, url, env, ctx) {
         'Content-Type': 'text/markdown; charset=utf-8',
         'Vary': 'User-Agent',
         'X-Rosetta-Status': 'HIT',
+        [ROSETTA_CACHE_STATUS_HEADER]: ROSETTA_CACHE_STATUS.HIT,
         'X-Rosetta-Savings': '98%'
       }
     });
@@ -580,6 +876,7 @@ async function handleProxyMode(request, url, env, ctx) {
               'Content-Type': 'text/markdown; charset=utf-8',
               'Vary': 'User-Agent',
               'X-Rosetta-Status': 'HIT',
+              [ROSETTA_CACHE_STATUS_HEADER]: ROSETTA_CACHE_STATUS.HIT,
               'X-Rosetta-Savings': '98%'
             }
           });
@@ -599,9 +896,9 @@ async function handleProxyMode(request, url, env, ctx) {
   }
 
   // Scrape with timeout
-  let markdown = null;
+  let scrapeResult = null;
   try {
-    markdown = await scrapeWithTimeout(canonical, env.FIRECRAWL_API_KEY, EXTRACT_TIMEOUT_MS);
+    scrapeResult = await scrapeWithTimeout(canonical, env.FIRECRAWL_API_KEY, EXTRACT_TIMEOUT_MS);
   } catch (err) {
     console.error('Scrape failed:', err);
   }
@@ -612,25 +909,31 @@ async function handleProxyMode(request, url, env, ctx) {
       .catch(err => console.error('KV pending delete failed:', err))
   );
 
-  if (markdown) {
-    ctx.waitUntil(
-      env.ROSETTA_CACHE.put(cacheKey, markdown, { expirationTtl: CACHE_TTL })
-        .catch(err => console.error('KV cache write failed:', err))
-    );
+  if (scrapeResult?.markdown) {
+    // Cache content using DRY helper (includes HTML for dashboard debugging)
+    cacheExtractedContent(env, ctx, hash, scrapeResult.markdown, scrapeResult.html);
 
-    return new Response(markdown, {
+    return new Response(scrapeResult.markdown, {
       headers: {
         'Content-Type': 'text/markdown; charset=utf-8',
         'Vary': 'User-Agent',
-        'X-Rosetta-Status': 'MISS (Rendered)'
+        'X-Rosetta-Status': 'MISS (Rendered)',
+        [ROSETTA_CACHE_STATUS_HEADER]: ROSETTA_CACHE_STATUS.MISS,
       }
     });
   }
 
   // Fallback to origin HTML
+  // Rule: Always return 200 to crawlers. Expose original status via header.
   const response = await proxyToOrigin(targetUrl, request);
-  const newResponse = new Response(response.body, response);
+  const originStatus = response.status;
+  const newResponse = new Response(response.body, {
+    status: 200,
+    headers: response.headers,
+  });
   newResponse.headers.set('X-Rosetta-Status', 'FAIL (Fallback)');
+  newResponse.headers.set(ROSETTA_CACHE_STATUS_HEADER, ROSETTA_CACHE_STATUS.FAIL);
+  newResponse.headers.set('X-Rosetta-Origin-Status', String(originStatus));
   newResponse.headers.set('Vary', 'User-Agent');
   return newResponse;
 }
@@ -648,7 +951,12 @@ async function handleCrawlStart(request, env, ctx) {
 
   let customer;
   try {
-    customer = await env.ROSETTA_CACHE.get(`apikey:${token}`, 'json');
+    const tokenHash = await sha256(token);
+    customer = await env.ROSETTA_CACHE.get(`apikeyhash:${tokenHash}`, 'json');
+
+    if (!customer) {
+      customer = await env.ROSETTA_CACHE.get(`apikey:${token}`, 'json');
+    }
   } catch (err) {
     console.error('KV auth lookup failed:', err);
     return jsonResponse({ error: 'Auth service unavailable' }, 503);
@@ -656,6 +964,11 @@ async function handleCrawlStart(request, env, ctx) {
 
   if (!customer) {
     return jsonResponse({ error: 'Invalid API token' }, 401);
+  }
+
+  const customerId = customer.id || customer.customerId;
+  if (!customerId) {
+    return jsonResponse({ error: 'Invalid customer config format' }, 500);
   }
 
   try {
@@ -683,14 +996,15 @@ async function handleCrawlStart(request, env, ctx) {
     const effectiveLimit = Math.min(limit, MAX_CRAWL_PAGES);
 
     if (mode === 'single') {
-      const markdown = await scrapeWithTimeout(targetUrl, env.FIRECRAWL_API_KEY, 10000); // Longer timeout for single
+      const scrapeResult = await scrapeWithTimeout(targetUrl, env.FIRECRAWL_API_KEY, 10000); // Longer timeout for single
+      const markdown = scrapeResult?.markdown || null;
+      const html = scrapeResult?.html || null;
 
       if (markdown && cacheResults) {
         const canonical = canonicalize(targetUrl);
-        const hash = await sha256(canonical);
-        ctx.waitUntil(
-          env.ROSETTA_CACHE.put(`md:${hash}`, markdown, { expirationTtl: CACHE_TTL })
-        );
+        const hash = await sha256(`${CANON_VERSION}:${canonical}`);
+        // Cache content using DRY helper (includes HTML for dashboard debugging)
+        cacheExtractedContent(env, ctx, hash, markdown, html);
       }
 
       return jsonResponse({
@@ -731,13 +1045,14 @@ async function handleCrawlStart(request, env, ctx) {
       return jsonResponse({ error: 'Invalid response from Firecrawl' }, 500);
     }
 
-    // Store crawl metadata
+    // Store crawl metadata (include allowedDomains for validation on cache write)
     const crawlMeta = {
       id: crawlData.id,
-      customerId: customer.id,
+      customerId: customerId,
       url: targetUrl,
       limit: effectiveLimit,
       cacheResults,
+      allowedDomains: customer.domains || [],
       startedAt: new Date().toISOString(),
       status: 'crawling'
     };
@@ -768,7 +1083,12 @@ async function handleCrawlStatus(crawlId, request, env, ctx) {
 
   let customer;
   try {
-    customer = await env.ROSETTA_CACHE.get(`apikey:${token}`, 'json');
+    const tokenHash = await sha256(token);
+    customer = await env.ROSETTA_CACHE.get(`apikeyhash:${tokenHash}`, 'json');
+
+    if (!customer) {
+      customer = await env.ROSETTA_CACHE.get(`apikey:${token}`, 'json');
+    }
   } catch (err) {
     console.error('KV auth lookup failed:', err);
     return jsonResponse({ error: 'Auth service unavailable' }, 503);
@@ -778,13 +1098,18 @@ async function handleCrawlStatus(crawlId, request, env, ctx) {
     return jsonResponse({ error: 'Invalid API token' }, 401);
   }
 
+  const customerId = customer.id || customer.customerId;
+  if (!customerId) {
+    return jsonResponse({ error: 'Invalid customer config format' }, 500);
+  }
+
   try {
     // Get stored metadata
     const metaRaw = await env.ROSETTA_CACHE.get(`crawl::${crawlId}`);
     const meta = metaRaw ? JSON.parse(metaRaw) : null;
 
     // Verify ownership
-    if (meta && meta.customerId !== customer.id) {
+    if (meta && meta.customerId !== customerId) {
       return jsonResponse({ error: 'Crawl job not found' }, 404);
     }
 
@@ -808,12 +1133,21 @@ async function handleCrawlStatus(crawlId, request, env, ctx) {
     // If completed, cache results (in background to avoid timeout)
     if (statusData.status === 'completed' && statusData.data && meta?.cacheResults) {
       // Use ctx.waitUntil to ensure caching completes even after response
+      // Extract allowed domains from meta to filter off-domain crawl results
+      const allowedDomains = meta.allowedDomains || [];
       ctx.waitUntil((async () => {
         try {
           for (const page of statusData.data) {
             if (page.markdown && page.metadata?.sourceURL) {
+              // Validate domain is in customer allowlist before caching
+              const pageUrl = new URL(page.metadata.sourceURL);
+              const pageHost = pageUrl.hostname.toLowerCase().replace(/^www\./, '');
+              if (allowedDomains.length > 0 && !allowedDomains.includes(pageHost)) {
+                console.warn(`Skipping off-domain crawl result: ${page.metadata.sourceURL}`);
+                continue;
+              }
               const canonical = canonicalize(page.metadata.sourceURL);
-              const hash = await sha256(canonical);
+              const hash = await sha256(`${CANON_VERSION}:${canonical}`);
               await env.ROSETTA_CACHE.put(`md:${hash}`, page.markdown, { expirationTtl: CACHE_TTL });
             }
           }
@@ -870,7 +1204,11 @@ async function handleCrawlStatus(crawlId, request, env, ctx) {
 function canonicalize(urlString) {
   const parsed = new URL(urlString);
   parsed.hash = '';
-  parsed.hostname = parsed.hostname.toLowerCase().replace(/^www\./, '');
+  // IMPORTANT:
+  // Do NOT strip `www.` here. Some sites (including many Next.js deployments) serve
+  // different content (or even 404) on apex vs www. We want to fetch/scrape the
+  // exact host the user requested.
+  parsed.hostname = parsed.hostname.toLowerCase();
 
   // Remove tracking params
   for (const param of TRACKING_PARAMS) {
@@ -913,36 +1251,97 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+function estimateTokens(text) {
+  if (!text) return 0;
+  return Math.ceil(text.length / 4);
+}
+
 /**
- * Scrape with Firecrawl (with timeout)
+ * Cache extracted content (markdown + optional HTML for debugging)
+ * DRY helper used by all extraction paths
+ * 
+ * @param {object} env - Worker env bindings
+ * @param {object} ctx - Worker context (for waitUntil)
+ * @param {string} hash - URL hash for cache keys
+ * @param {string} md - Markdown content
+ * @param {string|null} html - Raw HTML (optional, for dashboard debugging)
+ * @param {object|null} logger - Optional logger for error reporting
  */
+function cacheExtractedContent(env, ctx, hash, md, html, logger = null) {
+  const mdKey = `md:${hash}`;
+  const htmlKey = `html:${hash}`;
+  const tokensKey = `tokens:${hash}`;
+
+  const report = (msg, err) => {
+    if (logger) logger.error(msg, err);
+    else console.error(`${msg}:`, err);
+  };
+
+  ctx.waitUntil(
+    env.ROSETTA_CACHE.put(mdKey, md, { expirationTtl: CACHE_TTL })
+      .catch(err => report('KV MD cache write failed', err))
+  );
+
+  if (html) {
+    ctx.waitUntil(
+      env.ROSETTA_CACHE.put(htmlKey, html, { expirationTtl: HTML_CACHE_TTL })
+        .catch(err => report('KV HTML cache write failed', err))
+    );
+  }
+
+  const htmlTokens = html ? estimateTokens(html) : null;
+  const mdTokens = estimateTokens(md);
+  ctx.waitUntil(
+    env.ROSETTA_CACHE.put(tokensKey, JSON.stringify({ htmlTokens, mdTokens, ts: Date.now() }), { expirationTtl: CACHE_TTL })
+      .catch(err => report('KV tokens cache write failed', err))
+  );
+
+  return { htmlTokens, mdTokens };
+}
+
 async function scrapeWithTimeout(targetUrl, apiKey, timeoutMs) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const response = await fetch(FIRECRAWL_SCRAPE_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiKey}`
-      },
-      body: JSON.stringify({
-        url: targetUrl,
-        formats: ['markdown'],
-        onlyMainContent: true,
+    // Fetch raw HTML from origin AND markdown from Firecrawl in parallel
+    // This gives us accurate token savings: raw HTML vs clean markdown
+    const [firecrawlResponse, rawHtmlResponse] = await Promise.all([
+      fetch(FIRECRAWL_SCRAPE_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${apiKey}`
+        },
+        body: JSON.stringify({
+          url: targetUrl,
+          formats: ['markdown'],
+          onlyMainContent: true,
+        }),
+        signal: controller.signal
       }),
-      signal: controller.signal
-    });
+      // Fetch raw HTML directly from origin with browser User-Agent
+      fetch(targetUrl, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        },
+        signal: controller.signal,
+        redirect: 'follow',
+      }).catch((err) => {
+        console.error(`Raw HTML fetch failed for ${targetUrl}:`, err?.message || err);
+        return null;
+      })
+    ]);
 
     clearTimeout(timeout);
 
-    if (!response.ok) {
-      console.error(`Firecrawl API Error: ${response.status}`);
+    if (!firecrawlResponse.ok) {
+      console.error(`Firecrawl API Error: ${firecrawlResponse.status}`);
       return null;
     }
 
-    const json = await response.json();
+    const json = await firecrawlResponse.json();
 
     if (!json.success || !json.data || !json.data.markdown) {
       console.error('Invalid Firecrawl response format');
@@ -950,15 +1349,30 @@ async function scrapeWithTimeout(targetUrl, apiKey, timeoutMs) {
     }
 
     const md = json.data.markdown;
+    
+    // Get raw HTML from origin (for accurate token comparison)
+    let rawHtml = null;
+    if (rawHtmlResponse) {
+      if (rawHtmlResponse.ok) {
+        try {
+          rawHtml = await rawHtmlResponse.text();
+          console.log(`Raw HTML fetched: ${rawHtml.length} bytes from ${targetUrl}`);
+        } catch (err) {
+          console.warn('Failed to read raw HTML response:', err);
+        }
+      } else {
+        console.warn(`Raw HTML fetch returned ${rawHtmlResponse.status} for ${targetUrl}`);
+      }
+    } else {
+      console.warn(`Raw HTML response is null for ${targetUrl}`);
+    }
 
-    // Reject if Firecrawl returned HTML
     if (isHTML(md)) {
       console.error('Firecrawl returned HTML instead of Markdown');
       return null;
     }
 
-    return md;
-
+    return { markdown: md, html: rawHtml };
   } catch (err) {
     clearTimeout(timeout);
     if (err.name === 'AbortError') {
@@ -991,12 +1405,14 @@ async function fetchFallback(url, originalRequest = null) {
 
     const res = await fetch(url, { headers });
     const html = await res.text();
+    // Rule: Always return 200 to crawlers. Expose original status via header.
     return new Response(html, {
-      status: res.status,
+      status: 200,
       headers: {
         'Content-Type': 'text/html; charset=utf-8',
         'X-Rosetta-Status': 'fallback',
-        'Access-Control-Allow-Origin': '*'
+        [ROSETTA_CACHE_STATUS_HEADER]: ROSETTA_CACHE_STATUS.FAIL,
+        'X-Rosetta-Origin-Status': String(res.status),
       }
     });
   } catch {
@@ -1006,7 +1422,8 @@ async function fetchFallback(url, originalRequest = null) {
       headers: {
         'Content-Type': 'text/html; charset=utf-8',
         'X-Rosetta-Status': 'error',
-        'Access-Control-Allow-Origin': '*'
+        [ROSETTA_CACHE_STATUS_HEADER]: ROSETTA_CACHE_STATUS.FAIL,
+        'X-Rosetta-Origin-Status': 'unavailable',
       }
     });
   }
@@ -1062,6 +1479,31 @@ async function incrementUsage(env, customerId) {
     await env.ROSETTA_CACHE.put(key, (current + 1).toString(), { expirationTtl: 86400 * 90 });
   } catch (err) {
     console.error('Usage increment failed:', err);
+  }
+}
+
+async function sendTokenMetrics(env, customerId, url, htmlTokens, mdTokens) {
+  try {
+    if (!env.DASHBOARD_API_KEY) return;
+    const dashboardUrl = env.DASHBOARD_API_URL || DASHBOARD_API_URL;
+    const apiUrl = `${dashboardUrl}/api/metrics/tokens`;
+
+    await fetch(apiUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${env.DASHBOARD_API_KEY}`,
+      },
+      body: JSON.stringify({
+        customerId,
+        url,
+        htmlTokens,
+        mdTokens,
+        optimizedAt: new Date().toISOString(),
+      }),
+    });
+  } catch (err) {
+    console.error('Failed to send token metrics:', err);
   }
 }
 

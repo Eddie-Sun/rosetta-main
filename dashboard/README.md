@@ -43,6 +43,37 @@ Then run migrations (requires env vars set):
 pnpm prisma:migrate
 ```
 
+### Prereqs (Firecrawl)
+
+Overview can generate a starter list of URLs using Firecrawl `/v2/map`.
+
+Add this to `dashboard/.env.local`:
+
+```bash
+FIRECRAWL_API_KEY=YOUR_FIRECRAWL_KEY
+```
+
+### Prereqs (Worker + KV)
+
+For production-style “Check” (dashboard triggers the worker to render/scrape a single page) the dashboard uses a **service-auth internal worker endpoint** and the worker uses **Cloudflare KV** as its auth/config source of truth.
+
+Add these to `dashboard/.env.local`:
+
+```bash
+# Dashboard -> Worker
+WORKER_API_URL=https://rosetta-worker.YOUR_ACCOUNT.workers.dev
+WORKER_INTERNAL_API_KEY=YOUR_INTERNAL_KEY
+
+# Worker -> Dashboard (metrics callback)
+DASHBOARD_API_KEY=YOUR_DASHBOARD_API_KEY
+
+# Dashboard -> Cloudflare KV (to sync domains/tokens)
+CLOUDFLARE_ACCOUNT_ID=YOUR_ACCOUNT_ID
+CLOUDFLARE_API_TOKEN=YOUR_API_TOKEN
+# Optional (defaults to bound namespace id):
+# CLOUDFLARE_KV_NAMESPACE_ID=...
+```
+
 ### Run
 
 First, run the development server:

@@ -91,11 +91,8 @@ export default function Home() {
                 Built to make your site visible to AI, Rosetta serves clean Markdown to crawlers—without changing your human HTML.
               </h1>
               <div className="mt-5 flex items-center gap-3">
-                <Button asChild>
-                  <Link href="/download">Download the middleware</Link>
-                </Button>
                 <Button variant="outline" asChild>
-                  <Link href="/agents">See it in action</Link>
+                  <Link href="/onboarding">See it in action</Link>
                 </Button>
               </div>
             </div>
