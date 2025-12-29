@@ -46,9 +46,9 @@ export function DataTable<TData extends UrlRow, TValue>({
     onRowSelectionChange: setRowSelection,
     enableRowSelection: (row) => !row.original.isSectionHeader,
     getRowCanExpand: (row) => {
-      return row.original.isSectionHeader && row.original.subRows && row.original.subRows.length > 0;
+      return Boolean(row.original.isSectionHeader && row.original.subRows && row.original.subRows.length > 0);
     },
-    getSubRows: (row) => row.original.subRows,
+    getSubRows: (row) => row.subRows as TData[] | undefined,
     getExpandedRowModel: getExpandedRowModel(),
     getCoreRowModel: getCoreRowModel(),
   });
@@ -65,9 +65,9 @@ export function DataTable<TData extends UrlRow, TValue>({
                     {header.isPlaceholder
                       ? null
                       : flexRender(
-                          header.column.columnDef.header,
-                          header.getContext()
-                        )}
+                        header.column.columnDef.header,
+                        header.getContext()
+                      )}
                   </TableHead>
                 );
               })}
@@ -98,10 +98,10 @@ export function DataTable<TData extends UrlRow, TValue>({
                     {row.getVisibleCells().map((cell) => {
                       const isSectionColumn = cell.column.id === "section";
                       const isSelectColumn = cell.column.id === "select";
-                      
+
                       return (
-                        <TableCell 
-                          key={cell.id} 
+                        <TableCell
+                          key={cell.id}
                           className={`py-2 ${isSelectColumn ? "pr-2 w-0" : isSectionColumn ? "pl-0" : ""}`}
                           onClick={(e) => {
                             if (isSelectColumn) {
@@ -122,9 +122,8 @@ export function DataTable<TData extends UrlRow, TValue>({
                                   }}
                                 >
                                   <ChevronRight
-                                    className={`h-4 w-4 text-accent transition-transform ${
-                                      isExpanded ? "rotate-90" : ""
-                                    }`}
+                                    className={`h-4 w-4 text-accent transition-transform ${isExpanded ? "rotate-90" : ""
+                                      }`}
                                   />
                                 </Button>
                               )}

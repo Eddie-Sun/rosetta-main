@@ -2,18 +2,14 @@
 
 import { auth } from "@clerk/nextjs/server";
 import { prisma } from "@/lib/prisma";
-import { syncCustomerAuthToKV } from "@/lib/tokens";
+import { normalizeDomain, syncCustomerAuthToKV } from "@/lib/tokens";
 
 type Result = { ok: true } | { ok: false; error: string };
 
-function normalizeHostname(hostname: string): string {
-  // Remove protocol if present
-  let normalized = hostname.replace(/^https?:\/\//, "");
-  // Remove trailing slash
+function sanitizeInputDomain(input: string): string {
+  let normalized = input.replace(/^https?:\/\//, "");
   normalized = normalized.replace(/\/$/, "");
-  // Remove www. prefix and lowercase
-  normalized = normalized.toLowerCase().replace(/^www\./, "");
-  return normalized;
+  return normalizeDomain(normalized);
 }
 
 export async function submitCompanyInfo(
@@ -31,7 +27,7 @@ export async function submitCompanyInfo(
     return { ok: false, error: "Domain is required" };
   }
 
-  const hostname = normalizeHostname(domain);
+  const hostname = sanitizeInputDomain(domain);
 
   try {
     const customerId = await prisma.$transaction(async (tx) => {
